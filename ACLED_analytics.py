@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Mon Oct  6 15:38:27 2025
+"""Streamlit analytic tool for ACLED data.
 
-@author: LWu
+Created on Mon Oct  6 15:38:27 2025
+Author: LWu
 """
-"""Streamlit analytic tool for ACLED data."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -97,12 +96,19 @@ def filter_by_keywords(
 ) -> pd.DataFrame:
     if not keywords:
         return df
-    mask = None
+
+    available_columns = [col for col in columns if col in df.columns]
+    if not available_columns:
+        return df
+
+    mask = pd.Series(False, index=df.index) if not match_all else pd.Series(True, index=df.index)
     for kw in keywords:
         col_mask = pd.Series(False, index=df.index)
-        for col in columns:
-            col_mask |= df[col].str.contains(kw, case=False, na=False)
-        mask = col_mask if mask is None else (mask & col_mask if match_all else mask | col_mask)
+        for col in available_columns:
+            series = df[col].fillna("").astype(str)
+            col_mask |= series.str.contains(kw, case=False, na=False)
+        mask = mask & col_mask if match_all else mask | col_mask
+
     return df[mask]
 
 
@@ -290,10 +296,17 @@ class FilterState:
 def render_sidebar(data: pd.DataFrame) -> FilterState:
     with st.sidebar:
         st.header("Global filters")
-        min_date, max_date = data[DATE_COL].min(), data[DATE_COL].max()
+        min_date_raw = pd.to_datetime(data[DATE_COL].min())
+        max_date_raw = pd.to_datetime(data[DATE_COL].max())
+        min_date = min_date_raw.date() if pd.notnull(min_date_raw) else None
+        max_date = max_date_raw.date() if pd.notnull(max_date_raw) else None
+        if not (min_date and max_date):
+            today = pd.Timestamp.utcnow().date()
+            min_date = max_date = today
+        default_range = (min_date, max_date)
         date_range = st.date_input(
             "Event date range",
-            value=(min_date, max_date),
+            value=default_range,
             min_value=min_date,
             max_value=max_date,
         )
