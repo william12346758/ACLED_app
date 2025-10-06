@@ -7,15 +7,11 @@ from typing import List, Sequence
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 from sklearn.cluster import KMeans
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import silhouette_score
-from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 import networkx as nx
-import textwrap
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -58,31 +54,6 @@ def load_data() -> pd.DataFrame:
     return df
 
 
-@st.cache_resource(show_spinner=False)
-def build_semantic_index(notes: pd.Series):
-    """Build a TF-IDF index to enable semantic matching on notes."""
-    prepared_notes = notes.fillna("").astype(str)
-    vectorizer = TfidfVectorizer(
-        stop_words="english",
-        max_features=5000,
-        ngram_range=(1, 2),
-    )
-    matrix = vectorizer.fit_transform(prepared_notes)
-    index_lookup = {idx: position for position, idx in enumerate(prepared_notes.index)}
-    return vectorizer, matrix, index_lookup
-
-
-@st.cache_resource(show_spinner=False)
-def build_context_matrix(notes: pd.Series):
-    """Create a compact TF-IDF representation of notes for contextual clustering."""
-    prepared_notes = notes.fillna("").astype(str)
-    vectorizer = TfidfVectorizer(stop_words="english", max_features=300, min_df=5)
-    matrix = vectorizer.fit_transform(prepared_notes)
-    index_lookup = {idx: position for position, idx in enumerate(prepared_notes.index)}
-    feature_names = vectorizer.get_feature_names_out()
-    return vectorizer, matrix, index_lookup, feature_names
-
-
 def parse_keywords(raw: str) -> List[str]:
     return [kw.strip() for kw in (raw or "").split(",") if kw.strip()]
 
@@ -118,41 +89,6 @@ def filter_by_context(
     return df[mask]
 
 
-def semantic_search(
-    df: pd.DataFrame,
-    query: str,
-    vectorizer: TfidfVectorizer,
-    matrix,
-    index_lookup: dict,
-    top_k: int = 20,
-) -> pd.DataFrame:
-    """Return the most semantically similar events for a user query."""
-    if not query.strip():
-        return pd.DataFrame(columns=df.columns.tolist() + ["semantic_score"])
-
-    query_vec = vectorizer.transform([query])
-    subset_positions: list[tuple[int, int]] = []
-    for df_position, idx in enumerate(df.index):
-        matrix_position = index_lookup.get(idx)
-        if matrix_position is not None:
-            subset_positions.append((df_position, matrix_position))
-
-    if not subset_positions:
-        return pd.DataFrame(columns=df.columns.tolist() + ["semantic_score"])
-
-    df_positions, matrix_positions = map(np.array, zip(*subset_positions))
-    subset_matrix = matrix[matrix_positions]
-    similarity = cosine_similarity(subset_matrix, query_vec).ravel()
-
-    if np.allclose(similarity, 0):
-        return pd.DataFrame(columns=df.columns.tolist() + ["semantic_score"])
-
-    order = np.argsort(similarity)[::-1][:top_k]
-    ranked_df = df.iloc[df_positions[order]].copy()
-    ranked_df["semantic_score"] = similarity[order]
-    return ranked_df
-
-
 def apply_filters(
     df: pd.DataFrame,
     date_range,
@@ -186,7 +122,6 @@ def cluster_events(
     df: pd.DataFrame,
     features: Sequence[str],
     n_clusters: int,
-    contextual_features: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, float | None]:
     if df.empty or not features:
         return df.assign(cluster="Not computed"), None
@@ -206,9 +141,6 @@ def cluster_events(
         encoded = encoder.fit_transform(feature_df[categorical_cols])
         transformed.append(encoded)
 
-    if contextual_features is not None:
-        transformed.append(contextual_features)
-
     if not transformed:
         return df.assign(cluster="Not computed"), None
 
@@ -226,58 +158,6 @@ def cluster_events(
     clustered_df = df.copy()
     clustered_df["cluster"] = clusters.astype(str)
     return clustered_df, silhouette
-
-
-def contextual_feature_matrix(
-    df: pd.DataFrame,
-    context_matrix,
-    index_lookup: dict,
-) -> np.ndarray | None:
-    """Extract contextual embeddings for the provided dataframe."""
-    subset_positions: list[int] = []
-    for idx in df.index:
-        matrix_position = index_lookup.get(idx)
-        if matrix_position is not None:
-            subset_positions.append(matrix_position)
-    if not subset_positions:
-        return None
-    subset = context_matrix[subset_positions]
-    return subset.toarray()
-
-
-def craft_event_story(row: pd.Series) -> str:
-    """Return a compact narrative used for map and network tooltips."""
-    date_value = row.get(DATE_COL)
-    if pd.notnull(date_value):
-        date_text = pd.to_datetime(date_value).strftime("%d %b %Y")
-    else:
-        date_text = "Unknown date"
-
-    location_bits = [str(val) for val in [row.get(ADMIN1_COL), row.get(COUNTRY_COL)] if val]
-    location_text = ", ".join(location_bits) if location_bits else "Location unavailable"
-
-    fatalities = row.get(FATALITIES_COL)
-    if pd.notnull(fatalities):
-        fatal_int = int(fatalities)
-        fatal_text = f"{fatal_int} fatality" if fatal_int == 1 else f"{fatal_int} fatalities"
-    else:
-        fatal_text = "Fatalities not reported"
-
-    notes = textwrap.shorten(str(row.get(NOTES_COL, "")).strip(), width=180, placeholder="…")
-    actor = row.get(ACTOR1_COL) or "Unknown actor"
-    event_text = row.get(EVENT_TYPE_COL) or "Event"
-    sub_event = row.get(SUB_EVENT_COL) or ""
-    sub_event_text = f" ({sub_event})" if sub_event else ""
-
-    story = (
-        f"<b>{date_text}</b><br>"
-        f"<span style='color:#4B5563'>{location_text}</span><br>"
-        f"<b>Primary actor:</b> {actor}<br>"
-        f"<b>Event:</b> {event_text}{sub_event_text}<br>"
-        f"<b>Impact:</b> {fatal_text}<br>"
-        f"<b>Context:</b> {notes}"
-    )
-    return story
 
 
 def build_actor_network(df: pd.DataFrame) -> nx.Graph:
@@ -308,8 +188,6 @@ st.caption(
 )
 
 data = load_data()
-semantic_vectorizer, semantic_matrix, semantic_index = build_semantic_index(data[NOTES_COL])
-context_vectorizer, context_matrix, context_index, _ = build_context_matrix(data[NOTES_COL])
 
 with st.sidebar:
     st.header("Global filters")
@@ -322,28 +200,8 @@ with st.sidebar:
     )
 
     countries = st.multiselect("Countries", options=sorted(data[COUNTRY_COL].dropna().unique()))
-    if countries:
-        admin_subset = (
-            data[data[COUNTRY_COL].isin(countries)][[COUNTRY_COL, ADMIN1_COL]]
-            .dropna()
-            .drop_duplicates()
-            .sort_values([COUNTRY_COL, ADMIN1_COL])
-        )
-    else:
-        admin_subset = (
-            data[[COUNTRY_COL, ADMIN1_COL]]
-            .dropna()
-            .drop_duplicates()
-            .sort_values([COUNTRY_COL, ADMIN1_COL])
-        )
-    admin1_options = list(admin_subset.itertuples(index=False, name=None))
-    admin1_selection = st.multiselect(
-        "Admin 1 regions",
-        options=admin1_options,
-        format_func=lambda item: f"{item[0]} — {item[1]}",
-        help="Selections reflect the chosen countries; deselect countries to browse all Admin 1 regions.",
-    )
-    admin1_selection_values = [item[1] for item in admin1_selection]
+    admin1_options = sorted(data[ADMIN1_COL].dropna().unique())
+    admin1_selection = st.multiselect("Admin 1 regions", options=admin1_options)
     event_types = st.multiselect("Event types", options=sorted(data[EVENT_TYPE_COL].dropna().unique()))
 
     st.markdown("---")
@@ -379,7 +237,7 @@ filtered = apply_filters(
     date_range,
     countries,
     event_types,
-    admin1_selection_values,
+    admin1_selection,
     keyword_filters,
     keyword_logic == "Match all",
     context_filters,
@@ -394,41 +252,9 @@ if filtered.empty:
     st.warning("No events match the selected filters. Adjust the parameters in the sidebar to continue.")
     st.stop()
 
-guide_tab, overview_tab, search_tab, cluster_tab, network_tab, data_tab = st.tabs(
-    [
-        "Guide",
-        "Overview map",
-        "Search insights",
-        "Clustering",
-        "Network analysis",
-        "Data table",
-    ]
+overview_tab, search_tab, cluster_tab, network_tab, data_tab = st.tabs(
+    ["Overview map", "Search insights", "Clustering", "Network analysis", "Data table"]
 )
-
-with guide_tab:
-    st.subheader("Getting started")
-    st.markdown(
-        """
-        Welcome to the ACLED Conflict Analytics Platform. The application preloads the curated
-        ACLED dataset bundled with this tool, so you can begin exploring immediately.
-
-        **How to navigate the app**
-
-        1. Use the **global filters** in the sidebar to focus on specific timelines, countries,
-           administrative regions, or thematic keywords. Spatial sliders help you spotlight
-           latitude and longitude ranges without leaving the page.
-        2. The **Overview map** blends an interactive map with temporal trendlines so you can
-           see where and when events occur.
-        3. **Search insights** combines traditional keyword filters with semantic search powered by
-           natural-language processing to surface relevant narratives.
-        4. Discover clusters of similar events—including optional context-aware groupings—in the
-           **Clustering** tab.
-        5. Reveal actor relationships and central players in the **Network analysis** view.
-        6. Export your working dataset at any point from the **Data table** tab.
-
-        Tip: hover over map markers or network nodes to read concise stories crafted for each event.
-        """
-    )
 
 with overview_tab:
     st.subheader("Geocoded events")
@@ -437,7 +263,6 @@ with overview_tab:
     size_choice = st.selectbox("Size events by", ["None", FATALITIES_COL])
 
     map_df = filtered.copy()
-    map_df["event_story"] = map_df.apply(craft_event_story, axis=1)
     if size_choice == "None":
         size_args = {}
     else:
@@ -448,25 +273,21 @@ with overview_tab:
         lat=LAT_COL,
         lon=LON_COL,
         color=color_choice,
-        hover_data=None,
-        custom_data=["event_story"],
+        hover_data={
+            "event_id": map_df["event_id_cnty"],
+            COUNTRY_COL: True,
+            ADMIN1_COL: True,
+            EVENT_TYPE_COL: True,
+            SUB_EVENT_COL: True,
+            FATALITIES_COL: True,
+            NOTES_COL: True,
+        },
         zoom=3,
         height=600,
         **size_args,
     )
-    marker_style = dict(opacity=0.82)
-    if size_choice == "None":
-        marker_style["size"] = 10
-    fig.update_traces(
-        hovertemplate="%{customdata[0]}<extra></extra>",
-        marker=marker_style,
-    )
-    fig.update_layout(
-        mapbox_style="carto-positron",
-        margin={"l": 0, "r": 0, "t": 0, "b": 0},
-        legend=dict(orientation="h", yanchor="bottom", y=0.99, x=0, xanchor="left"),
-    )
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": False})
+    fig.update_layout(mapbox_style="carto-positron", margin={"l": 0, "r": 0, "t": 0, "b": 0})
+    st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Temporal trend")
     trend_freq = st.selectbox("Aggregate by", ["week", "month", "year"], index=1)
@@ -491,64 +312,7 @@ with search_tab:
     search_cols = ["event_id_cnty", DATE_COL, COUNTRY_COL, ADMIN1_COL, EVENT_TYPE_COL, SUB_EVENT_COL, ACTOR1_COL, NOTES_COL]
     st.dataframe(filtered[search_cols].head(200), use_container_width=True, hide_index=True)
 
-    st.subheader("Semantic search (NLP)")
-    st.markdown(
-        "Describe the type of incident you are investigating to retrieve semantically similar events, even when exact keywords differ."
-    )
-    semantic_query = st.text_input("Semantic query", placeholder="e.g. attacks on aid workers near border crossings")
-    semantic_limit = st.slider("Number of semantic matches", min_value=5, max_value=50, value=15, step=5)
-    if semantic_query:
-        semantic_results = semantic_search(
-            filtered,
-            semantic_query,
-            semantic_vectorizer,
-            semantic_matrix,
-            semantic_index,
-            top_k=semantic_limit,
-        )
-        if semantic_results.empty:
-            st.warning("No semantic matches were found for this query within the filtered events.")
-        else:
-            semantic_results = semantic_results.assign(event_story=lambda x: x.apply(craft_event_story, axis=1))
-            top_three = semantic_results.head(3)
-            for _, row in top_three.iterrows():
-                st.markdown(f"{row['event_story']}", unsafe_allow_html=True)
-                st.caption(f"Semantic similarity score: {row['semantic_score']:.3f}")
-            st.dataframe(
-                semantic_results[
-                    [
-                        "semantic_score",
-                        DATE_COL,
-                        COUNTRY_COL,
-                        ADMIN1_COL,
-                        EVENT_TYPE_COL,
-                        SUB_EVENT_COL,
-                        ACTOR1_COL,
-                        NOTES_COL,
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-    else:
-        st.caption("Enter a semantic query above to activate contextual matching.")
-
     st.subheader("Contextual highlights")
-    context_positions = [context_index.get(idx) for idx in filtered.index if context_index.get(idx) is not None]
-    if context_positions:
-        term_strength = np.asarray(context_matrix[context_positions].sum(axis=0)).ravel()
-        top_context_ids = term_strength.argsort()[::-1][:10]
-        top_context_terms = pd.DataFrame(
-            {
-                "context": context_vectorizer.get_feature_names_out()[top_context_ids],
-                "relevance": term_strength[top_context_ids],
-            }
-        )
-        st.table(top_context_terms)
-        st.caption("Top contextual themes by TF-IDF weight within the filtered events.")
-    else:
-        st.info("Contextual term summaries will appear once events are available in the filtered set.")
-
     if context_filters:
         context_counts = (
             filtered.assign(match_context=lambda x: x[NOTES_COL].str.lower())
@@ -579,26 +343,11 @@ with cluster_tab:
         options=available_features,
         default=[LAT_COL, LON_COL, FATALITIES_COL],
     )
-    use_context_topics = st.checkbox(
-        "Incorporate context from notes",
-        value=False,
-        help="Augment clustering with TF-IDF embeddings derived from the notes column to group events with similar narratives.",
-    )
     cluster_count = st.slider("Number of clusters", min_value=2, max_value=10, value=4)
     run_cluster = st.button("Run clustering")
 
     if run_cluster:
-        contextual_features = None
-        if use_context_topics:
-            contextual_features = contextual_feature_matrix(filtered, context_matrix, context_index)
-            if contextual_features is None:
-                st.warning("Contextual embeddings could not be generated for the current selection.")
-        clustered_df, silhouette = cluster_events(
-            filtered,
-            selected_features,
-            cluster_count,
-            contextual_features=contextual_features,
-        )
+        clustered_df, silhouette = cluster_events(filtered, selected_features, cluster_count)
         if "cluster" not in clustered_df.columns or clustered_df["cluster"].isna().all():
             st.warning("Unable to compute clusters with the current selection.")
         else:
@@ -611,24 +360,18 @@ with cluster_tab:
             )
             st.dataframe(cluster_counts, use_container_width=True)
 
-            cluster_display = clustered_df.assign(event_story=lambda x: x.apply(craft_event_story, axis=1))
             cluster_fig = px.scatter_mapbox(
-                cluster_display,
+                clustered_df,
                 lat=LAT_COL,
                 lon=LON_COL,
                 color="cluster",
-                hover_name=None,
-                hover_data=None,
-                custom_data=["event_story", "cluster"],
+                hover_name="event_id_cnty",
+                hover_data={EVENT_TYPE_COL: True, SUB_EVENT_COL: True, FATALITIES_COL: True, NOTES_COL: True},
                 zoom=3,
                 height=600,
             )
-            cluster_fig.update_traces(
-                hovertemplate="Cluster %{customdata[1]}<br>%{customdata[0]}<extra></extra>",
-                marker=dict(opacity=0.8, size=10),
-            )
             cluster_fig.update_layout(mapbox_style="carto-positron", margin={"l": 0, "r": 0, "t": 0, "b": 0})
-            st.plotly_chart(cluster_fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": False})
+            st.plotly_chart(cluster_fig, use_container_width=True)
     else:
         st.info("Select features and click 'Run clustering' to generate event clusters.")
 
@@ -645,68 +388,40 @@ with network_tab:
         degree_series = pd.Series(dict(graph.degree(weight="weight")))
         top_nodes = degree_series.sort_values(ascending=False).head(top_n).index.tolist()
         subgraph = graph.subgraph(top_nodes)
-        centrality = nx.degree_centrality(subgraph)
-        weighted_degree = dict(subgraph.degree(weight="weight"))
         pos = nx.spring_layout(subgraph, weight="weight", seed=42)
 
-        if centrality:
-            max_centrality = max(centrality.values()) or 1
-            for node, coords in pos.items():
-                scale = 0.35 + (1 - (centrality[node] / max_centrality))
-                pos[node] = np.array(coords) * scale
+        edge_x, edge_y = [], []
+        for src, dst in subgraph.edges():
+            x0, y0 = pos[src]
+            x1, y1 = pos[dst]
+            edge_x.extend([x0, x1, None])
+            edge_y.extend([y0, y1, None])
 
-        edge_traces = []
-        for src, dst, attrs in subgraph.edges(data=True):
-            weight = attrs.get("weight", 1)
-            edge_trace = go.Scatter(
-                x=[pos[src][0], pos[dst][0]],
-                y=[pos[src][1], pos[dst][1]],
-                mode="lines",
-                line=dict(width=1 + weight * 0.2, color="#c6dbef"),
-                hoverinfo="text",
-                text=f"{src} ↔ {dst}<br>Interactions: {weight}",
-            )
-            edge_traces.append(edge_trace)
+        node_x = [pos[node][0] for node in subgraph.nodes()]
+        node_y = [pos[node][1] for node in subgraph.nodes()]
+        node_size = [subgraph.degree(node, weight="weight") * 10 for node in subgraph.nodes()]
 
-        node_trace = go.Scatter(
-            x=[pos[node][0] for node in subgraph.nodes()],
-            y=[pos[node][1] for node in subgraph.nodes()],
-            mode="markers+text",
-            text=[node for node in subgraph.nodes()],
-            textposition="top center",
-            marker=dict(
-                size=[12 + centrality.get(node, 0) * 80 for node in subgraph.nodes()],
-                color="#3182bd",
-                line=dict(width=1.5, color="#f7fbff"),
-            ),
-            hovertemplate=[
-                f"<b>{node}</b><br>Weighted degree: {weighted_degree.get(node, 0):.0f}<br>Centrality: {centrality.get(node, 0):.3f}<extra></extra>"
-                for node in subgraph.nodes()
-            ],
+        network_fig = px.scatter(
+            x=node_x,
+            y=node_y,
+            text=list(subgraph.nodes()),
+            size=node_size,
         )
-
-        network_fig = go.Figure(data=edge_traces + [node_trace])
+        network_fig.update_traces(marker=dict(color="#3182bd", line=dict(width=1, color="#ffffff")))
+        network_fig.add_scatter(x=edge_x, y=edge_y, mode="lines", line=dict(color="#9ecae1", width=1), hoverinfo="none")
         network_fig.update_layout(
             showlegend=False,
             xaxis=dict(visible=False),
             yaxis=dict(visible=False),
             height=600,
             margin=dict(l=0, r=0, t=40, b=0),
-            plot_bgcolor="#ffffff",
-            paper_bgcolor="#ffffff",
         )
-        st.plotly_chart(network_fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(network_fig, use_container_width=True)
 
+        centrality = nx.degree_centrality(subgraph)
         centrality_df = (
-            pd.DataFrame(
-                {
-                    "actor": list(subgraph.nodes()),
-                    "weighted_degree": [weighted_degree.get(node, 0) for node in subgraph.nodes()],
-                    "centrality": [centrality.get(node, 0) for node in subgraph.nodes()],
-                }
-            )
+            pd.DataFrame({"actor": list(centrality.keys()), "centrality": list(centrality.values())})
             .sort_values("centrality", ascending=False)
-            .reset_index(drop=True)
         )
         st.table(centrality_df)
 
