@@ -451,19 +451,34 @@ def cluster_events(
     if df.empty or not features:
         return df.assign(cluster="Not computed"), None
 
-    feature_df = df[features].copy()
-    numeric_cols = feature_df.select_dtypes(include=["number"]).columns.tolist()
+    if len(df) < max(n_clusters, 2):
+        return df.assign(cluster="Not computed"), None
+
+    feature_df = df[list(features)].copy()
+    numeric_cols = feature_df.select_dtypes(include=["number", "bool"]).columns.tolist()
     categorical_cols = [col for col in features if col not in numeric_cols]
 
-    transformed = []
     if numeric_cols:
+        numeric_values = feature_df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+        # Replace missing numeric values with column medians to keep KMeans stable.
+        medians = numeric_values.median().fillna(0)
+        numeric_values = numeric_values.fillna(medians)
         scaler = StandardScaler()
-        numeric_vals = scaler.fit_transform(feature_df[numeric_cols])
+        numeric_vals = scaler.fit_transform(numeric_values)
+    else:
+        numeric_vals = None
+
+    transformed: list[np.ndarray] = []
+    if numeric_vals is not None:
         transformed.append(numeric_vals)
 
     if categorical_cols:
-        encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
-        encoded = encoder.fit_transform(feature_df[categorical_cols])
+        categoricals = feature_df[categorical_cols].fillna("Unknown")
+        try:
+            encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+        except TypeError:  # Fallback for older scikit-learn versions
+            encoder = OneHotEncoder(sparse=False, handle_unknown="ignore")
+        encoded = encoder.fit_transform(categoricals)
         transformed.append(encoded)
 
     if contextual_features is not None:
@@ -473,7 +488,14 @@ def cluster_events(
         return df.assign(cluster="Not computed"), None
 
     matrix = np.hstack(transformed)
-    model = KMeans(n_clusters=n_clusters, n_init="auto", random_state=42)
+    if not np.isfinite(matrix).all():
+        return df.assign(cluster="Not computed"), None
+
+    n_init = "auto"
+    try:
+        model = KMeans(n_clusters=n_clusters, n_init=n_init, random_state=42)
+    except TypeError:  # Older scikit-learn compatibility
+        model = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
     clusters = model.fit_predict(matrix)
 
     silhouette = None
@@ -515,7 +537,13 @@ def render_sidebar(data: pd.DataFrame) -> FilterState:
         if not (min_date and max_date):
             today = pd.Timestamp.utcnow().date()
             min_date = max_date = today
+
         default_range = (min_date, max_date)
+        if pd.notnull(min_date_raw) and pd.notnull(max_date_raw):
+            recent_start = max_date_raw - pd.DateOffset(months=3)
+            if pd.notnull(recent_start):
+                bounded_start = max(recent_start, min_date_raw)
+                default_range = (bounded_start.date(), max_date)
         date_range = st.date_input(
             "Event date range",
             value=default_range,
@@ -594,8 +622,14 @@ def render_sidebar(data: pd.DataFrame) -> FilterState:
 def apply_filters(df: pd.DataFrame, state: FilterState) -> pd.DataFrame:
     filtered = df.copy()
     if state.date_range and len(state.date_range) == 2:
-        start, end = state.date_range
-        filtered = filtered[(filtered[DATE_COL] >= pd.to_datetime(start)) & (filtered[DATE_COL] <= pd.to_datetime(end))]
+        start_raw, end_raw = state.date_range
+        start_ts = pd.to_datetime(start_raw)
+        end_ts = pd.to_datetime(end_raw)
+        if pd.isna(start_ts) or pd.isna(end_ts):
+            start_ts, end_ts = df[DATE_COL].min(), df[DATE_COL].max()
+        if start_ts > end_ts:
+            start_ts, end_ts = end_ts, start_ts
+        filtered = filtered[(filtered[DATE_COL] >= start_ts) & (filtered[DATE_COL] <= end_ts)]
     if state.countries:
         filtered = filtered[filtered[COUNTRY_COL].isin(state.countries)]
     if state.event_types:
@@ -662,7 +696,7 @@ def render_overview_tab(filtered: pd.DataFrame):
         }
 
     size_args: dict[str, float] = {}
-    if size_choice != "None":
+    if size_choice != "None" and size_choice in map_df.columns:
         size_args = {
             "size": map_df[size_choice].clip(lower=0).fillna(0) + 2,
             "size_max": 14,
@@ -706,15 +740,18 @@ def render_overview_tab(filtered: pd.DataFrame):
         .reset_index()
         .sort_values(trend_freq)
     )
-    line_fig = px.line(trend_df, x=trend_freq, y="events", markers=True)
-    line_fig.update_layout(yaxis_title="Number of events", xaxis_title=trend_freq.title())
-    st.plotly_chart(line_fig, use_container_width=True)
-    st.download_button(
-        "Download temporal trend",
-        data=trend_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"overview_trend_{trend_freq}.csv",
-        mime="text/csv",
-    )
+    if trend_df.empty:
+        st.info("Temporal trend data will appear once events match the selected filters.")
+    else:
+        line_fig = px.line(trend_df, x=trend_freq, y="events", markers=True)
+        line_fig.update_layout(yaxis_title="Number of events", xaxis_title=trend_freq.title())
+        st.plotly_chart(line_fig, use_container_width=True)
+        st.download_button(
+            "Download temporal trend",
+            data=trend_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"overview_trend_{trend_freq}.csv",
+            mime="text/csv",
+        )
 
 
 def render_search_tab(
@@ -744,14 +781,18 @@ def render_search_tab(
         ACTOR1_COL,
         NOTES_COL,
     ]
-    keyword_results = filtered[search_cols].copy()
-    st.dataframe(keyword_results.head(200), use_container_width=True, hide_index=True)
-    st.download_button(
-        "Download keyword matches",
-        data=keyword_results.to_csv(index=False).encode("utf-8"),
-        file_name="search_keyword_results.csv",
-        mime="text/csv",
-    )
+    available_search_cols = [col for col in search_cols if col in filtered.columns]
+    keyword_results = filtered[available_search_cols].copy()
+    if keyword_results.empty:
+        st.warning("No keyword results available for the current filters.")
+    else:
+        st.dataframe(keyword_results.head(200), use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download keyword matches",
+            data=keyword_results.to_csv(index=False).encode("utf-8"),
+            file_name="search_keyword_results.csv",
+            mime="text/csv",
+        )
 
     st.subheader("Semantic search (NLP)")
     st.markdown(
@@ -885,6 +926,18 @@ def render_clustering_tab(
         st.info("Select features and click 'Run clustering' to generate event clusters.")
         return
 
+    if not selected_features:
+        st.error("Select at least one feature before running clustering.")
+        return
+
+    missing_features = [feature for feature in selected_features if feature not in filtered.columns]
+    if missing_features:
+        st.error(
+            "The following features are unavailable in the filtered dataset: "
+            + ", ".join(missing_features)
+        )
+        return
+
     contextual_features = None
     svd_model: TruncatedSVD | None = None
     if use_context_topics:
@@ -916,6 +969,9 @@ def render_clustering_tab(
     )
     if "cluster" not in clustered_df.columns or clustered_df["cluster"].isna().all():
         st.warning("Unable to compute clusters with the current selection.")
+        return
+    if clustered_df["cluster"].eq("Not computed").all():
+        st.warning("Clustering could not be computed with the selected configuration.")
         return
 
     st.success("Clustering complete.")
@@ -956,7 +1012,7 @@ def render_clustering_tab(
     )
     cluster_fig.update_traces(
         hovertemplate="Cluster %{customdata[1]}<br>%{customdata[0]}<extra></extra>",
-        marker=dict(size=7, line=dict(width=0.5, color="#f8fafc")),
+        marker=dict(size=7),
         opacity=0.85,
     )
     cluster_fig.update_layout(mapbox_style="carto-positron", margin={"l": 0, "r": 0, "t": 0, "b": 0})
@@ -997,10 +1053,27 @@ def render_network_tab(filtered: pd.DataFrame):
         st.warning("Not enough actor association data to build a network for the selected filters.")
         return
 
-    top_n = st.slider("Show top actors", min_value=5, max_value=30, value=10)
     degree_series = pd.Series(dict(graph.degree(weight="weight")))
+    if degree_series.empty:
+        st.warning("Unable to determine actor centrality for the selected filters.")
+        return
+    max_nodes_available = int(degree_series.size)
+    if max_nodes_available < 2:
+        st.warning("Not enough distinct actors to build a network for the selected filters.")
+        return
+    slider_min = min(5, max_nodes_available)
+    slider_default = min(10, max_nodes_available)
+    top_n = st.slider(
+        "Show top actors",
+        min_value=slider_min,
+        max_value=max_nodes_available,
+        value=slider_default,
+    )
     top_nodes = degree_series.sort_values(ascending=False).head(top_n).index.tolist()
-    subgraph = graph.subgraph(top_nodes)
+    subgraph = graph.subgraph(top_nodes).copy()
+    if subgraph.number_of_nodes() == 0:
+        st.warning("No actor relationships available after applying the selected filters.")
+        return
     centrality = nx.degree_centrality(subgraph)
     weighted_degree = dict(subgraph.degree(weight="weight"))
     pos = nx.kamada_kawai_layout(subgraph, weight="weight")
@@ -1018,7 +1091,8 @@ def render_network_tab(filtered: pd.DataFrame):
         )
         edge_traces.append(edge_trace)
 
-    degree_values = np.array([weighted_degree.get(node, 0) for node in subgraph.nodes()], dtype=float)
+    node_order = list(subgraph.nodes())
+    degree_values = np.array([weighted_degree.get(node, 0) for node in node_order], dtype=float)
     if degree_values.size == 0:
         node_sizes = []
         node_colours = []
@@ -1033,11 +1107,17 @@ def render_network_tab(filtered: pd.DataFrame):
         node_sizes = (min_size + (max_size - min_size) * scaled).tolist()
         node_colours = degree_values.tolist()
         colour_max = max_degree if max_degree > 0 else 1
+    node_customdata = np.column_stack(
+        [
+            [weighted_degree.get(node, 0) for node in node_order],
+            [centrality.get(node, 0.0) for node in node_order],
+        ]
+    )
     node_trace = go.Scatter(
-        x=[pos[node][0] for node in subgraph.nodes()],
-        y=[pos[node][1] for node in subgraph.nodes()],
+        x=[pos[node][0] for node in node_order],
+        y=[pos[node][1] for node in node_order],
         mode="markers+text",
-        text=[node for node in subgraph.nodes()],
+        text=node_order,
         textposition="top center",
         textfont=dict(size=12, color="#1f2937"),
         marker=dict(
@@ -1050,10 +1130,8 @@ def render_network_tab(filtered: pd.DataFrame):
             colorbar=dict(title="Weighted degree"),
             line=dict(width=1.2, color="#f8fafc"),
         ),
-        hovertemplate=[
-            f"<b>{node}</b><br>Weighted degree: {weighted_degree.get(node, 0):.0f}<br>Centrality: {centrality.get(node, 0):.3f}<extra></extra>"
-            for node in subgraph.nodes()
-        ],
+        customdata=node_customdata,
+        hovertemplate="<b>%{text}</b><br>Weighted degree: %{customdata[0]:.0f}<br>Centrality: %{customdata[1]:.3f}<extra></extra>",
     )
 
     network_fig = go.Figure(data=edge_traces + [node_trace])
