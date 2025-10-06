@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import itertools
 from pathlib import Path
+import re
 from typing import Sequence
 
 import networkx as nx
@@ -182,7 +183,84 @@ def semantic_search(
     order = np.argsort(similarity)[::-1][:top_k]
     ranked_df = df.iloc[df_positions[order]].copy()
     ranked_df["semantic_score"] = similarity[order]
-    return ranked_df
+
+    # Apply conservative filtering to reduce semantic false positives.
+    filtered_ranked_df = apply_semantic_filters(ranked_df, query)
+    similarity_threshold = 0.12
+    filtered_ranked_df = filtered_ranked_df[filtered_ranked_df["semantic_score"] >= similarity_threshold]
+    return filtered_ranked_df
+
+
+SEMANTIC_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "that",
+    "this",
+    "into",
+    "onto",
+    "over",
+    "under",
+    "about",
+    "after",
+    "before",
+    "between",
+    "without",
+    "against",
+    "towards",
+    "toward",
+    "among",
+    "into",
+    "per",
+    "within",
+}
+
+
+def apply_semantic_filters(results: pd.DataFrame, query: str) -> pd.DataFrame:
+    """Reduce semantic matches that do not contain the key query concepts."""
+
+    if results.empty:
+        return results
+
+    query = query.lower()
+    raw_tokens = re.findall(r"[\w']+", query)
+    tokens = [token for token in raw_tokens if len(token) > 2 and token not in SEMANTIC_STOPWORDS]
+    if not tokens:
+        return results
+
+    # Expand tokens to include simple morphological variants for stricter containment checks.
+    expanded_tokens: set[str] = set()
+    for token in tokens:
+        expanded_tokens.add(token)
+        if token.endswith("es") and len(token) > 3:
+            expanded_tokens.add(token[:-2])
+        if token.endswith("s") and len(token) > 3:
+            expanded_tokens.add(token[:-1])
+        if token.endswith("ed") and len(token) > 3:
+            expanded_tokens.add(token[:-2])
+        if token.endswith("ing") and len(token) > 4:
+            expanded_tokens.add(token[:-3])
+    expanded_tokens_list = sorted(expanded_tokens)
+
+    phrases = [
+        f"{raw_tokens[i]} {raw_tokens[i + 1]}"
+        for i in range(len(raw_tokens) - 1)
+        if raw_tokens[i] not in SEMANTIC_STOPWORDS or raw_tokens[i + 1] not in SEMANTIC_STOPWORDS
+    ]
+
+    required_token_matches = len(expanded_tokens_list) if len(expanded_tokens_list) > 1 else 1
+
+    def note_matches(note: str) -> bool:
+        lowered = note.lower()
+        if any(phrase in lowered for phrase in phrases):
+            return True
+        matches = sum(token in lowered for token in expanded_tokens_list)
+        return matches >= required_token_matches
+
+    mask = results[NOTES_COL].fillna("").astype(str).apply(note_matches)
+    return results[mask]
 
 
 def align_context_matrix(
@@ -878,7 +956,8 @@ def render_clustering_tab(
     )
     cluster_fig.update_traces(
         hovertemplate="Cluster %{customdata[1]}<br>%{customdata[0]}<extra></extra>",
-        marker=dict(opacity=0.85, size=7, line=dict(width=0.5, color="#f8fafc")),
+        marker=dict(size=7, line=dict(width=0.5, color="#f8fafc")),
+        opacity=0.85,
     )
     cluster_fig.update_layout(mapbox_style="carto-positron", margin={"l": 0, "r": 0, "t": 0, "b": 0})
     st.plotly_chart(cluster_fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": False})
@@ -939,9 +1018,21 @@ def render_network_tab(filtered: pd.DataFrame):
         )
         edge_traces.append(edge_trace)
 
-    node_sizes = [10 + weighted_degree.get(node, 0) * 2 for node in subgraph.nodes()]
-    node_colours = [weighted_degree.get(node, 0) for node in subgraph.nodes()]
-    colour_max = max(node_colours) if node_colours else 1
+    degree_values = np.array([weighted_degree.get(node, 0) for node in subgraph.nodes()], dtype=float)
+    if degree_values.size == 0:
+        node_sizes = []
+        node_colours = []
+        colour_max = 1
+    else:
+        max_degree = degree_values.max()
+        min_size, max_size = 14, 34
+        if max_degree == 0:
+            scaled = np.zeros_like(degree_values)
+        else:
+            scaled = np.sqrt(degree_values / max_degree)
+        node_sizes = (min_size + (max_size - min_size) * scaled).tolist()
+        node_colours = degree_values.tolist()
+        colour_max = max_degree if max_degree > 0 else 1
     node_trace = go.Scatter(
         x=[pos[node][0] for node in subgraph.nodes()],
         y=[pos[node][1] for node in subgraph.nodes()],
