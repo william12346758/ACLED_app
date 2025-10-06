@@ -7,6 +7,7 @@ Author: LWu
 from __future__ import annotations
 
 from dataclasses import dataclass
+import itertools
 from pathlib import Path
 from typing import Sequence
 
@@ -17,6 +18,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from sklearn.cluster import KMeans
+from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import silhouette_score
 from sklearn.metrics.pairwise import cosine_similarity
@@ -40,6 +42,17 @@ ACTOR1_COL = "actor1"
 ASSOC_ACTOR1_COL = "assoc_actor_1"
 
 st.set_page_config(page_title="ACLED Conflict Analytics", layout="wide")
+
+
+# Colour palettes
+QUALITATIVE_SCHEMES = {
+    EVENT_TYPE_COL: px.colors.qualitative.Set2,
+    SUB_EVENT_COL: px.colors.qualitative.Safe,
+    COUNTRY_COL: px.colors.qualitative.Dark24,
+    "year": px.colors.qualitative.Prism,
+    "month": px.colors.qualitative.Prism,
+    "cluster": px.colors.qualitative.Bold,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +95,17 @@ def build_context_matrix(notes: pd.Series):
     index_lookup = {idx: position for position, idx in enumerate(prepared_notes.index)}
     feature_names = vectorizer.get_feature_names_out()
     return vectorizer, matrix, index_lookup, feature_names
+
+
+def build_colour_mapping(df: pd.DataFrame, column: str, palette_key: str | None = None) -> dict:
+    """Return a consistent colour mapping for a categorical column."""
+    key = palette_key or column
+    palette = QUALITATIVE_SCHEMES.get(key)
+    if palette is None or column not in df.columns:
+        return {}
+    unique_values = [value for value in df[column].dropna().astype(str).sort_values().unique()]
+    colour_cycle = itertools.cycle(palette)
+    return {value: next(colour_cycle) for value in unique_values}
 
 
 def parse_keywords(raw: str) -> list[str]:
@@ -161,21 +185,131 @@ def semantic_search(
     return ranked_df
 
 
+def align_context_matrix(
+    df: pd.DataFrame,
+    context_matrix,
+    context_index: dict,
+):
+    """Align the TF-IDF matrix with dataframe rows."""
+    df_positions: list[int] = []
+    matrix_positions: list[int] = []
+    for df_position, idx in enumerate(df.index):
+        matrix_position = context_index.get(idx)
+        if matrix_position is None:
+            continue
+        df_positions.append(df_position)
+        matrix_positions.append(matrix_position)
+    if not matrix_positions:
+        return None, None
+    subset = context_matrix[matrix_positions]
+    return subset, np.array(df_positions)
+
+
 def contextual_feature_matrix(
     df: pd.DataFrame,
     context_matrix,
     index_lookup: dict,
-) -> np.ndarray | None:
-    """Extract contextual embeddings for the provided dataframe."""
-    subset_positions: list[int] = []
-    for idx in df.index:
-        matrix_position = index_lookup.get(idx)
-        if matrix_position is not None:
-            subset_positions.append(matrix_position)
-    if not subset_positions:
-        return None
-    subset = context_matrix[subset_positions]
-    return subset.toarray()
+    n_components: int = 12,
+) -> tuple[np.ndarray | None, TruncatedSVD | None]:
+    """Extract contextual embeddings via truncated SVD for the provided dataframe."""
+    subset, df_positions = align_context_matrix(df, context_matrix, index_lookup)
+    if subset is None:
+        return None, None
+
+    max_components = min(n_components, subset.shape[0] - 1, subset.shape[1] - 1)
+    if max_components <= 0:
+        return None, None
+
+    svd = TruncatedSVD(n_components=max_components, random_state=42)
+    reduced = svd.fit_transform(subset)
+
+    contextual_features = np.zeros((len(df), reduced.shape[1]))
+    contextual_features[df_positions] = reduced
+    return contextual_features, svd
+
+
+def build_context_summary(
+    df: pd.DataFrame,
+    context_matrix,
+    context_index: dict,
+    context_vectorizer: TfidfVectorizer,
+    top_terms: int = 8,
+) -> pd.DataFrame:
+    """Create a contextual summary table with representative events for top TF-IDF themes."""
+    subset, df_positions = align_context_matrix(df, context_matrix, context_index)
+    if subset is None:
+        return pd.DataFrame()
+
+    term_strength = np.asarray(subset.sum(axis=0)).ravel()
+    if not np.any(term_strength):
+        return pd.DataFrame()
+
+    feature_names = context_vectorizer.get_feature_names_out()
+    top_indices = term_strength.argsort()[::-1][:top_terms]
+
+    rows: list[dict] = []
+    for term_idx in top_indices:
+        weight = float(term_strength[term_idx])
+        if weight <= 0:
+            continue
+        column = subset[:, term_idx].toarray().ravel()
+        if not np.any(column):
+            continue
+        event_position = int(column.argmax())
+        df_position = int(df_positions[event_position])
+        event_row = df.iloc[df_position]
+        date_value = event_row.get(DATE_COL)
+        date_text = "Unknown"
+        if pd.notnull(date_value):
+            date_text = pd.to_datetime(date_value).strftime("%Y-%m-%d")
+        location_bits = [event_row.get(ADMIN1_COL), event_row.get(COUNTRY_COL)]
+        location = ", ".join([str(bit) for bit in location_bits if bit]) or "Location unavailable"
+        rows.append(
+            {
+                "theme": feature_names[term_idx],
+                "salience": round(weight, 3),
+                "event_date": date_text,
+                "location": location,
+                "representative_note": textwrap.shorten(
+                    str(event_row.get(NOTES_COL, "")).strip(), width=160, placeholder="…"
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def summarise_cluster_contexts(
+    clustered_df: pd.DataFrame,
+    context_matrix,
+    context_index: dict,
+    context_vectorizer: TfidfVectorizer,
+    top_terms: int = 5,
+) -> pd.DataFrame:
+    """Summarise clusters with dominant note themes."""
+    if "cluster" not in clustered_df.columns:
+        return pd.DataFrame()
+
+    summaries: list[dict] = []
+    for cluster_label, group in clustered_df.groupby("cluster"):
+        subset, _ = align_context_matrix(group, context_matrix, context_index)
+        if subset is None:
+            continue
+        term_strength = np.asarray(subset.sum(axis=0)).ravel()
+        if not np.any(term_strength):
+            continue
+        feature_names = context_vectorizer.get_feature_names_out()
+        top_indices = term_strength.argsort()[::-1][:top_terms]
+        top_terms_list = [feature_names[idx] for idx in top_indices if term_strength[idx] > 0]
+        summaries.append(
+            {
+                "cluster": str(cluster_label),
+                "events": len(group),
+                "dominant_themes": ", ".join(top_terms_list),
+            }
+        )
+
+    return pd.DataFrame(summaries)
 
 
 def craft_event_story(row: pd.Series) -> str:
@@ -437,24 +571,41 @@ def render_overview_tab(filtered: pd.DataFrame):
 
     map_df = filtered.copy()
     map_df["event_story"] = map_df.apply(craft_event_story, axis=1)
+    colour_column = color_choice
+    if colour_column in map_df.columns and map_df[colour_column].dtype != object:
+        colour_column = f"{color_choice}_label"
+        map_df[colour_column] = map_df[color_choice].astype(str)
+    colour_map = build_colour_mapping(map_df, colour_column, palette_key=color_choice)
+    colour_args: dict = {}
+    if colour_map:
+        colour_args = {
+            "color_discrete_map": colour_map,
+            "category_orders": {colour_column: list(colour_map.keys())},
+        }
+
     size_args: dict[str, float] = {}
     if size_choice != "None":
-        size_args = {"size": map_df[size_choice].clip(lower=0).fillna(0) + 5, "size_max": 20}
+        size_args = {
+            "size": map_df[size_choice].clip(lower=0).fillna(0) + 2,
+            "size_max": 14,
+        }
 
     fig = px.scatter_mapbox(
         map_df,
         lat=LAT_COL,
         lon=LON_COL,
-        color=color_choice,
+        color=colour_column,
         hover_data=None,
         custom_data=["event_story"],
         zoom=3,
         height=600,
         **size_args,
+        **colour_args,
     )
     marker_style = dict(opacity=0.82)
     if size_choice == "None":
-        marker_style["size"] = 10
+        marker_style["size"] = 6
+    marker_style.setdefault("sizemin", 3)
     fig.update_traces(hovertemplate="%{customdata[0]}<extra></extra>", marker=marker_style)
     fig.update_layout(
         mapbox_style="carto-positron",
@@ -462,6 +613,12 @@ def render_overview_tab(filtered: pd.DataFrame):
         legend=dict(orientation="h", yanchor="bottom", y=0.99, x=0, xanchor="left"),
     )
     st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": False})
+    st.download_button(
+        "Download map events",
+        data=map_df.drop(columns=["event_story"], errors="ignore").to_csv(index=False).encode("utf-8"),
+        file_name="overview_map_events.csv",
+        mime="text/csv",
+    )
 
     st.subheader("Temporal trend")
     trend_freq = st.selectbox("Aggregate by", ["week", "month", "year"], index=1)
@@ -474,6 +631,12 @@ def render_overview_tab(filtered: pd.DataFrame):
     line_fig = px.line(trend_df, x=trend_freq, y="events", markers=True)
     line_fig.update_layout(yaxis_title="Number of events", xaxis_title=trend_freq.title())
     st.plotly_chart(line_fig, use_container_width=True)
+    st.download_button(
+        "Download temporal trend",
+        data=trend_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"overview_trend_{trend_freq}.csv",
+        mime="text/csv",
+    )
 
 
 def render_search_tab(
@@ -503,7 +666,14 @@ def render_search_tab(
         ACTOR1_COL,
         NOTES_COL,
     ]
-    st.dataframe(filtered[search_cols].head(200), use_container_width=True, hide_index=True)
+    keyword_results = filtered[search_cols].copy()
+    st.dataframe(keyword_results.head(200), use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download keyword matches",
+        data=keyword_results.to_csv(index=False).encode("utf-8"),
+        file_name="search_keyword_results.csv",
+        mime="text/csv",
+    )
 
     st.subheader("Semantic search (NLP)")
     st.markdown(
@@ -511,6 +681,7 @@ def render_search_tab(
     )
     semantic_query = st.text_input("Semantic query", placeholder="e.g. attacks on aid workers near border crossings")
     semantic_limit = st.slider("Number of semantic matches", min_value=5, max_value=50, value=15, step=5)
+    semantic_results = pd.DataFrame()
     if semantic_query:
         semantic_results = semantic_search(
             filtered,
@@ -547,38 +718,58 @@ def render_search_tab(
     else:
         st.caption("Enter a semantic query above to activate contextual matching.")
 
-    st.subheader("Contextual highlights")
-    context_positions = [context_index.get(idx) for idx in filtered.index if context_index.get(idx) is not None]
-    if context_positions:
-        term_strength = np.asarray(context_matrix[context_positions].sum(axis=0)).ravel()
-        top_context_ids = term_strength.argsort()[::-1][:10]
-        top_context_terms = pd.DataFrame(
-            {
-                "context": context_vectorizer.get_feature_names_out()[top_context_ids],
-                "relevance": term_strength[top_context_ids],
-            }
+    if not semantic_results.empty:
+        st.download_button(
+            "Download semantic matches",
+            data=semantic_results.drop(columns=["event_story"], errors="ignore").to_csv(index=False).encode("utf-8"),
+            file_name="search_semantic_results.csv",
+            mime="text/csv",
         )
-        st.table(top_context_terms)
-        st.caption("Top contextual themes by TF-IDF weight within the filtered events.")
+
+    st.subheader("Contextual highlights")
+    context_summary = build_context_summary(filtered, context_matrix, context_index, context_vectorizer)
+    if context_summary.empty:
+        st.info("Contextual themes will appear once there is sufficient narrative information in the filtered events.")
     else:
-        st.info("Contextual term summaries will appear once events are available in the filtered set.")
+        st.markdown(
+            "The table below surfaces the most salient note themes together with a representative event for each context."
+        )
+        st.dataframe(context_summary, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download contextual themes",
+            data=context_summary.to_csv(index=False).encode("utf-8"),
+            file_name="search_contextual_themes.csv",
+            mime="text/csv",
+        )
 
     if filter_state.context_filters:
         context_counts = (
             filtered.assign(match_context=lambda x: x[NOTES_COL].str.lower())
-            .assign(matches=lambda x: x["match_context"].apply(lambda txt: [ctx for ctx in filter_state.context_filters if ctx.lower() in txt]))
+            .assign(
+                matches=lambda x: x["match_context"].apply(
+                    lambda txt: [ctx for ctx in filter_state.context_filters if ctx.lower() in txt]
+                )
+            )
         )
-        context_summary = (
+        context_filter_summary = (
             context_counts.explode("matches")
             .dropna(subset=["matches"])
             .groupby("matches")
             .agg(events=("event_id_cnty", "count"), fatalities=(FATALITIES_COL, "sum"))
             .reset_index()
+            .rename(columns={"matches": "context"})
+            .sort_values("events", ascending=False)
         )
-        if context_summary.empty:
+        if context_filter_summary.empty:
             st.warning("No contextual matches found in the filtered events.")
         else:
-            st.table(context_summary.sort_values("events", ascending=False))
+            st.table(context_filter_summary)
+            st.download_button(
+                "Download context filter summary",
+                data=context_filter_summary.to_csv(index=False).encode("utf-8"),
+                file_name="search_context_filter_summary.csv",
+                mime="text/csv",
+            )
     else:
         st.info("Add context terms from the sidebar to analyse themes in the notes column.")
 
@@ -587,9 +778,17 @@ def render_clustering_tab(
     filtered: pd.DataFrame,
     context_matrix,
     context_index: dict,
+    context_vectorizer: TfidfVectorizer,
 ):
     st.subheader("Cluster events by attributes")
-    st.markdown("Group events using K-means clustering across spatial, temporal, and categorical features.")
+    st.markdown(
+        "Group events using K-means clustering across spatial, temporal, categorical, and optional narrative features to reveal "
+        "cohesive incident archetypes."
+    )
+    st.caption(
+        "When narrative themes are enabled, the notes column is vectorised with TF-IDF, compressed into latent topics via "
+        "truncated SVD, and blended with the selected variables before clustering."
+    )
     available_features = [LAT_COL, LON_COL, FATALITIES_COL, "year", EVENT_TYPE_COL, SUB_EVENT_COL, ADMIN1_COL]
     selected_features = st.multiselect(
         "Select features for clustering",
@@ -597,9 +796,9 @@ def render_clustering_tab(
         default=[LAT_COL, LON_COL, FATALITIES_COL],
     )
     use_context_topics = st.checkbox(
-        "Incorporate context from notes",
+        "Incorporate narrative themes from notes",
         value=False,
-        help="Augment clustering with TF-IDF embeddings derived from the notes column to group events with similar narratives.",
+        help="Augment clustering with latent themes derived from the notes column to group events with similar narratives.",
     )
     cluster_count = st.slider("Number of clusters", min_value=2, max_value=10, value=4)
     run_cluster = st.button("Run clustering")
@@ -609,10 +808,27 @@ def render_clustering_tab(
         return
 
     contextual_features = None
+    svd_model: TruncatedSVD | None = None
     if use_context_topics:
-        contextual_features = contextual_feature_matrix(filtered, context_matrix, context_index)
-        if contextual_features is None:
+        contextual_features, svd_model = contextual_feature_matrix(
+            filtered, context_matrix, context_index
+        )
+        if contextual_features is None or svd_model is None:
             st.warning("Contextual embeddings could not be generated for the current selection.")
+        else:
+            topic_terms: list[str] = []
+            feature_names = context_vectorizer.get_feature_names_out()
+            for component in svd_model.components_[:3]:
+                top_term_ids = component.argsort()[::-1][:5]
+                topic_terms.append(
+                    ", ".join(feature_names[idx] for idx in top_term_ids)
+                )
+            if topic_terms:
+                st.markdown(
+                    "**Top narrative themes incorporated:**\n" + "\n".join(
+                        f"• {terms}" for terms in topic_terms
+                    )
+                )
 
     clustered_df, silhouette = cluster_events(
         filtered,
@@ -632,8 +848,22 @@ def render_clustering_tab(
         mean_fatalities=(FATALITIES_COL, "mean"),
     )
     st.dataframe(cluster_counts, use_container_width=True)
+    st.download_button(
+        "Download cluster summary",
+        data=cluster_counts.to_csv().encode("utf-8"),
+        file_name="cluster_summary.csv",
+        mime="text/csv",
+    )
 
     cluster_display = clustered_df.assign(event_story=lambda x: x.apply(craft_event_story, axis=1))
+    cluster_display["cluster"] = cluster_display["cluster"].astype(str)
+    cluster_colour_map = build_colour_mapping(cluster_display, "cluster", palette_key="cluster")
+    cluster_colour_args: dict = {}
+    if cluster_colour_map:
+        cluster_colour_args = {
+            "color_discrete_map": cluster_colour_map,
+            "category_orders": {"cluster": list(cluster_colour_map.keys())},
+        }
     cluster_fig = px.scatter_mapbox(
         cluster_display,
         lat=LAT_COL,
@@ -644,18 +874,45 @@ def render_clustering_tab(
         custom_data=["event_story", "cluster"],
         zoom=3,
         height=600,
+        **cluster_colour_args,
     )
     cluster_fig.update_traces(
         hovertemplate="Cluster %{customdata[1]}<br>%{customdata[0]}<extra></extra>",
-        marker=dict(opacity=0.8, size=10),
+        marker=dict(opacity=0.85, size=7, line=dict(width=0.5, color="#f8fafc")),
     )
     cluster_fig.update_layout(mapbox_style="carto-positron", margin={"l": 0, "r": 0, "t": 0, "b": 0})
     st.plotly_chart(cluster_fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": False})
+    st.download_button(
+        "Download clustered events",
+        data=clustered_df.to_csv(index=False).encode("utf-8"),
+        file_name="clustered_events.csv",
+        mime="text/csv",
+    )
+
+    cluster_theme_summary = summarise_cluster_contexts(
+        clustered_df, context_matrix, context_index, context_vectorizer
+    )
+    if not cluster_theme_summary.empty:
+        st.subheader("Narrative themes by cluster")
+        st.caption(
+            "TF-IDF themes from the notes column are aggregated per cluster to clarify how narratives differ between groups."
+        )
+        st.dataframe(cluster_theme_summary.sort_values("cluster"), use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download cluster theme summary",
+            data=cluster_theme_summary.to_csv(index=False).encode("utf-8"),
+            file_name="cluster_theme_summary.csv",
+            mime="text/csv",
+        )
 
 
 def render_network_tab(filtered: pd.DataFrame):
     st.subheader("Actor association network")
     st.markdown("Construct a co-occurrence network from primary actors and their associated actors within events.")
+    st.caption(
+        "Nodes represent actors; edges are weighted by the number of events in which the pair co-occur. Node colour and size"
+        " scale with weighted degree centrality."
+    )
     graph = build_actor_network(filtered)
     if graph.number_of_edges() == 0:
         st.warning("Not enough actor association data to build a network for the selected filters.")
@@ -667,13 +924,7 @@ def render_network_tab(filtered: pd.DataFrame):
     subgraph = graph.subgraph(top_nodes)
     centrality = nx.degree_centrality(subgraph)
     weighted_degree = dict(subgraph.degree(weight="weight"))
-    pos = nx.spring_layout(subgraph, weight="weight", seed=42)
-
-    if centrality:
-        max_centrality = max(centrality.values()) or 1
-        for node, coords in pos.items():
-            scale = 0.35 + (1 - (centrality[node] / max_centrality))
-            pos[node] = np.array(coords) * scale
+    pos = nx.kamada_kawai_layout(subgraph, weight="weight")
 
     edge_traces: list[go.Scatter] = []
     for src, dst, attrs in subgraph.edges(data=True):
@@ -682,22 +933,31 @@ def render_network_tab(filtered: pd.DataFrame):
             x=[pos[src][0], pos[dst][0]],
             y=[pos[src][1], pos[dst][1]],
             mode="lines",
-            line=dict(width=1 + weight * 0.2, color="#c6dbef"),
+            line=dict(width=0.8 + weight * 0.15, color="#bcd2e8"),
             hoverinfo="text",
             text=f"{src} ↔ {dst}<br>Interactions: {weight}",
         )
         edge_traces.append(edge_trace)
 
+    node_sizes = [10 + weighted_degree.get(node, 0) * 2 for node in subgraph.nodes()]
+    node_colours = [weighted_degree.get(node, 0) for node in subgraph.nodes()]
+    colour_max = max(node_colours) if node_colours else 1
     node_trace = go.Scatter(
         x=[pos[node][0] for node in subgraph.nodes()],
         y=[pos[node][1] for node in subgraph.nodes()],
         mode="markers+text",
         text=[node for node in subgraph.nodes()],
         textposition="top center",
+        textfont=dict(size=12, color="#1f2937"),
         marker=dict(
-            size=[12 + centrality.get(node, 0) * 80 for node in subgraph.nodes()],
-            color="#3182bd",
-            line=dict(width=1.5, color="#f7fbff"),
+            size=node_sizes,
+            color=node_colours,
+            colorscale="Blues",
+            cmin=0,
+            cmax=colour_max,
+            showscale=True,
+            colorbar=dict(title="Weighted degree"),
+            line=dict(width=1.2, color="#f8fafc"),
         ),
         hovertemplate=[
             f"<b>{node}</b><br>Weighted degree: {weighted_degree.get(node, 0):.0f}<br>Centrality: {centrality.get(node, 0):.3f}<extra></extra>"
@@ -711,9 +971,10 @@ def render_network_tab(filtered: pd.DataFrame):
         xaxis=dict(visible=False),
         yaxis=dict(visible=False),
         height=600,
-        margin=dict(l=0, r=0, t=40, b=0),
-        plot_bgcolor="#ffffff",
-        paper_bgcolor="#ffffff",
+        margin=dict(l=40, r=40, t=60, b=40),
+        plot_bgcolor="#f8fafc",
+        paper_bgcolor="#f8fafc",
+        title=dict(text="Actor co-occurrence network", x=0.5, font=dict(size=16, color="#1f2937")),
     )
     st.plotly_chart(network_fig, use_container_width=True, config={"displayModeBar": False})
 
@@ -729,6 +990,30 @@ def render_network_tab(filtered: pd.DataFrame):
         .reset_index(drop=True)
     )
     st.table(centrality_df)
+    st.download_button(
+        "Download network centrality",
+        data=centrality_df.to_csv(index=False).encode("utf-8"),
+        file_name="network_centrality.csv",
+        mime="text/csv",
+    )
+
+    edge_df = (
+        pd.DataFrame(
+            [
+                {"source": src, "target": dst, "weight": attrs.get("weight", 1)}
+                for src, dst, attrs in subgraph.edges(data=True)
+            ]
+        )
+        .sort_values("weight", ascending=False)
+        .reset_index(drop=True)
+    )
+    if not edge_df.empty:
+        st.download_button(
+            "Download network edges",
+            data=edge_df.to_csv(index=False).encode("utf-8"),
+            file_name="network_edges.csv",
+            mime="text/csv",
+        )
 
 
 def render_data_tab(filtered: pd.DataFrame):
@@ -789,7 +1074,7 @@ def main():
             context_index,
         )
     with cluster_tab:
-        render_clustering_tab(filtered, context_matrix, context_index)
+        render_clustering_tab(filtered, context_matrix, context_index, context_vectorizer)
     with network_tab:
         render_network_tab(filtered)
     with data_tab:
