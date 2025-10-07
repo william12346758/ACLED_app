@@ -31,11 +31,6 @@ import textwrap
 class DataLoadingError(RuntimeError):
     """Raised when the ACLED source dataset cannot be loaded."""
 
-try:
-    from sentence_transformers import SentenceTransformer
-except ImportError:  # pragma: no cover - optional dependency for language-guided clustering
-    SentenceTransformer = None
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -52,6 +47,7 @@ NOTES_COL = "notes"
 FATALITIES_COL = "fatalities"
 ACTOR1_COL = "actor1"
 ASSOC_ACTOR1_COL = "assoc_actor_1"
+INTER1_COL = "inter1"
 
 
 DATA_USE_COLUMNS = [
@@ -61,6 +57,7 @@ DATA_USE_COLUMNS = [
     SUB_EVENT_COL,
     ACTOR1_COL,
     ASSOC_ACTOR1_COL,
+    INTER1_COL,
     COUNTRY_COL,
     ADMIN1_COL,
     LAT_COL,
@@ -146,6 +143,8 @@ def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     prepared[NOTES_COL] = prepared[NOTES_COL].fillna("")
     prepared[ACTOR1_COL] = prepared[ACTOR1_COL].fillna("Unknown actor")
     prepared[ASSOC_ACTOR1_COL] = prepared[ASSOC_ACTOR1_COL].fillna("")
+    if INTER1_COL in prepared.columns:
+        prepared[INTER1_COL] = prepared[INTER1_COL].fillna("Unknown category")
     return prepared
 
 
@@ -310,128 +309,6 @@ def select_top_term_indices(term_strength: np.ndarray, feature_names: np.ndarray
     return selected
 
 
-@st.cache_resource(show_spinner=False)
-def load_sentence_model():
-    if SentenceTransformer is None:
-        return None
-    try:
-        candidate_models = [
-            "sentence-transformers/paraphrase-MiniLM-L3-v2",
-            "sentence-transformers/all-MiniLM-L6-v2",
-        ]
-        errors: list[str] = []
-        for model_name in candidate_models:
-            try:
-                return SentenceTransformer(model_name)
-            except Exception as exc:  # pragma: no cover - best-effort fallback
-                errors.append(f"{model_name}: {exc}")
-                logger.warning("Unable to load sentence transformer '%s': %s", model_name, exc)
-        if errors:
-            logger.warning("All candidate sentence transformers failed to load: %s", "; ".join(errors))
-    except Exception as exc:  # pragma: no cover - defensive guard
-        logger.warning("Unexpected error while loading sentence transformer: %s", exc)
-    return None
-
-
-@st.cache_resource(show_spinner=False)
-def build_note_embeddings(notes: pd.Series):
-    model = load_sentence_model()
-    if model is None:
-        return None, None
-    prepared_notes = notes.fillna("").astype(str)
-    try:
-        embeddings = model.encode(
-            prepared_notes.tolist(),
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
-    except TypeError:
-        embeddings = model.encode(
-            prepared_notes.tolist(),
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
-        # Normalise manually if the library version does not support the parameter.
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1
-        embeddings = embeddings / norms
-    index_lookup = {idx: position for position, idx in enumerate(prepared_notes.index)}
-    return embeddings, index_lookup
-
-
-def align_embeddings(df: pd.DataFrame, embeddings, index_lookup: dict):
-    if embeddings is None or index_lookup is None:
-        return None, None
-    subset_positions: list[tuple[int, int]] = []
-    for df_position, idx in enumerate(df.index):
-        matrix_position = index_lookup.get(idx)
-        if matrix_position is not None:
-            subset_positions.append((df_position, matrix_position))
-    if not subset_positions:
-        return None, None
-    df_positions, matrix_positions = map(np.array, zip(*subset_positions))
-    subset_embeddings = embeddings[matrix_positions]
-    return subset_embeddings, df_positions
-
-
-def language_guided_clustering(
-    df: pd.DataFrame,
-    note_embeddings,
-    note_index_lookup: dict,
-    query: str,
-    cluster_count: int,
-    max_events: int = 250,
-):
-    """Cluster events guided by a natural-language query using sentence-transformer embeddings."""
-    model = load_sentence_model()
-    if model is None:
-        return None, "model_unavailable"
-    query = query.strip()
-    if not query:
-        return None, "empty_query"
-    subset_embeddings, df_positions = align_embeddings(df, note_embeddings, note_index_lookup)
-    if subset_embeddings is None:
-        return None, "no_embeddings"
-    try:
-        query_embedding = model.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
-    except TypeError:
-        query_embedding = model.encode([query], show_progress_bar=False, convert_to_numpy=True)[0]
-        norm = np.linalg.norm(query_embedding)
-        if norm > 0:
-            query_embedding = query_embedding / norm
-    similarities = subset_embeddings @ query_embedding
-    if not np.any(similarities > 0):
-        return None, "no_similarity"
-
-    order = np.argsort(similarities)[::-1][:max_events]
-    ordered_scores = similarities[order]
-    positive_mask = ordered_scores > 0.05
-    selected_indices = order[positive_mask]
-    if selected_indices.size < cluster_count * 2:
-        broader_mask = ordered_scores > 0
-        selected_indices = order[broader_mask]
-    if selected_indices.size < cluster_count * 2:
-        return None, "insufficient_events"
-
-    selected_embeddings = subset_embeddings[selected_indices]
-    selected_positions = df_positions[selected_indices]
-    selected_df = df.iloc[selected_positions].copy()
-    selected_df["similarity"] = similarities[selected_indices]
-
-    adjusted_clusters = min(cluster_count, max(2, selected_df.shape[0] // 3))
-    if adjusted_clusters < 2 or selected_df.shape[0] < adjusted_clusters:
-        return None, "insufficient_events"
-
-    try:
-        model_kmeans = KMeans(n_clusters=adjusted_clusters, random_state=42, n_init="auto")
-    except TypeError:
-        model_kmeans = KMeans(n_clusters=adjusted_clusters, random_state=42, n_init=10)
-    labels = model_kmeans.fit_predict(selected_embeddings)
-    selected_df["cluster"] = labels.astype(str)
-    return selected_df, "ok"
-
-
 def build_colour_mapping(df: pd.DataFrame, column: str, palette_key: str | None = None) -> dict:
     """Return a consistent colour mapping for a categorical column."""
     key = palette_key or column
@@ -447,7 +324,7 @@ def parse_keywords(raw: str) -> list[str]:
     return [kw.strip() for kw in (raw or "").split(",") if kw.strip()]
 
 
-def filter_by_keywords(
+def filter_by_terms(
     df: pd.DataFrame,
     keywords: Sequence[str],
     columns: Sequence[str],
@@ -468,20 +345,6 @@ def filter_by_keywords(
             col_mask |= series.str.contains(kw, case=False, na=False)
         mask = mask & col_mask if match_all else mask | col_mask
 
-    return df[mask]
-
-
-def filter_by_context(
-    df: pd.DataFrame,
-    contexts: Sequence[str],
-    match_all: bool = True,
-) -> pd.DataFrame:
-    if not contexts:
-        return df
-    mask = pd.Series(True, index=df.index) if match_all else pd.Series(False, index=df.index)
-    for ctx in contexts:
-        ctx_mask = df[NOTES_COL].str.contains(ctx, case=False, na=False)
-        mask = mask & ctx_mask if match_all else mask | ctx_mask
     return df[mask]
 
 
@@ -640,59 +503,6 @@ def contextual_feature_matrix(
     return contextual_features, svd
 
 
-def build_context_summary(
-    df: pd.DataFrame,
-    context_matrix,
-    context_index: dict,
-    context_vectorizer: TfidfVectorizer,
-    top_terms: int = 8,
-) -> pd.DataFrame:
-    """Create a contextual summary table with representative events for top TF-IDF themes."""
-    subset, df_positions = align_context_matrix(df, context_matrix, context_index)
-    if subset is None:
-        return pd.DataFrame()
-
-    term_strength = np.asarray(subset.sum(axis=0)).ravel()
-    if not np.any(term_strength):
-        return pd.DataFrame()
-
-    feature_names = context_vectorizer.get_feature_names_out()
-    top_indices = select_top_term_indices(term_strength, feature_names, top_terms)
-    if not top_indices:
-        return pd.DataFrame()
-
-    rows: list[dict] = []
-    for term_idx in top_indices:
-        weight = float(term_strength[term_idx])
-        if weight <= 0:
-            continue
-        column = subset[:, term_idx].toarray().ravel()
-        if not np.any(column):
-            continue
-        event_position = int(column.argmax())
-        df_position = int(df_positions[event_position])
-        event_row = df.iloc[df_position]
-        date_value = event_row.get(DATE_COL)
-        date_text = "Unknown"
-        if pd.notnull(date_value):
-            date_text = pd.to_datetime(date_value).strftime("%Y-%m-%d")
-        location_bits = [event_row.get(ADMIN1_COL), event_row.get(COUNTRY_COL)]
-        location = ", ".join([str(bit) for bit in location_bits if bit]) or "Location unavailable"
-        rows.append(
-            {
-                "theme": feature_names[term_idx],
-                "salience": round(weight, 3),
-                "event_date": date_text,
-                "location": location,
-                "representative_note": textwrap.shorten(
-                    str(event_row.get(NOTES_COL, "")).strip(), width=160, placeholder="…"
-                ),
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
 def summarise_cluster_contexts(
     clustered_df: pd.DataFrame,
     context_matrix,
@@ -764,20 +574,22 @@ def build_actor_network(df: pd.DataFrame) -> nx.Graph:
     graph = nx.Graph()
     for _, row in df.iterrows():
         actor = str(row.get(ACTOR1_COL) or "").strip()
-        assoc = str(row.get(ASSOC_ACTOR1_COL) or "").strip()
-        if not actor or not assoc:
+        actor_type = str(row.get(INTER1_COL) or "").strip()
+        if not actor or not actor_type or actor == actor_type:
             continue
         fatalities_value = row.get(FATALITIES_COL)
         fatality = float(fatalities_value) if pd.notnull(fatalities_value) else 0.0
-        for node in (actor, assoc):
+        for node, node_type in ((actor, "Actor"), (actor_type, "Actor category")):
             if not graph.has_node(node):
-                graph.add_node(node, fatalities=0.0, events=0)
+                graph.add_node(node, fatalities=0.0, events=0, node_type=node_type)
+            else:
+                graph.nodes[node].setdefault("node_type", node_type)
             graph.nodes[node]["fatalities"] += fatality
             graph.nodes[node]["events"] += 1
-        if graph.has_edge(actor, assoc):
-            graph[actor][assoc]["weight"] += 1
+        if graph.has_edge(actor, actor_type):
+            graph[actor][actor_type]["weight"] += 1
         else:
-            graph.add_edge(actor, assoc, weight=1)
+            graph.add_edge(actor, actor_type, weight=1)
     return graph
 
 
@@ -858,10 +670,8 @@ class FilterState:
     countries: list[str]
     admin1_values: list[str]
     event_types: list[str]
-    keyword_filters: list[str]
-    keyword_match_all: bool
-    context_filters: list[str]
-    context_match_all: bool
+    text_filters: list[str]
+    text_match_all: bool
     lat_range: tuple[float, float]
     lon_range: tuple[float, float]
 
@@ -917,13 +727,17 @@ def render_sidebar(data: pd.DataFrame) -> FilterState:
         event_types = st.multiselect("Event types", options=sorted(data[EVENT_TYPE_COL].dropna().unique()))
 
         st.markdown("---")
-        st.subheader("Keyword search")
-        keyword_raw = st.text_input("Keywords (comma separated)")
-        keyword_logic = st.selectbox("Keyword match", ["Match any", "Match all"], index=0)
-
-        st.subheader("Context in notes")
-        context_raw = st.text_input("Context terms (comma separated)")
-        context_logic = st.selectbox("Context match", ["Match all", "Match any"], index=0)
+        st.subheader("Text search")
+        text_raw = st.text_input(
+            "Keywords or phrases (comma separated)",
+            help="Search across notes, actor names, and location text using any comma-separated terms.",
+        )
+        text_logic = st.selectbox(
+            "Text match",
+            ["Match any", "Match all"],
+            index=0,
+            help="Match any will return events containing at least one term; Match all requires every term to appear.",
+        )
 
         st.markdown("---")
         lat_min, lat_max = float(data[LAT_COL].min()), float(data[LAT_COL].max())
@@ -946,10 +760,8 @@ def render_sidebar(data: pd.DataFrame) -> FilterState:
         countries=list(countries),
         admin1_values=admin1_values,
         event_types=list(event_types),
-        keyword_filters=parse_keywords(keyword_raw),
-        keyword_match_all=keyword_logic == "Match all",
-        context_filters=parse_keywords(context_raw),
-        context_match_all=context_logic == "Match all",
+        text_filters=parse_keywords(text_raw),
+        text_match_all=text_logic == "Match all",
         lat_range=(float(lat_range[0]), float(lat_range[1])),
         lon_range=(float(lon_range[0]), float(lon_range[1])),
     )
@@ -980,8 +792,12 @@ def apply_filters(df: pd.DataFrame, state: FilterState) -> pd.DataFrame:
         (filtered[LAT_COL].between(state.lat_range[0], state.lat_range[1]))
         & (filtered[LON_COL].between(state.lon_range[0], state.lon_range[1]))
     ]
-    filtered = filter_by_keywords(filtered, state.keyword_filters, [NOTES_COL, ACTOR1_COL, ADMIN1_COL, "location"], state.keyword_match_all)
-    filtered = filter_by_context(filtered, state.context_filters, state.context_match_all)
+    filtered = filter_by_terms(
+        filtered,
+        state.text_filters,
+        [NOTES_COL, ACTOR1_COL, ASSOC_ACTOR1_COL, ADMIN1_COL, "location"],
+        state.text_match_all,
+    )
     return filtered
 
 
@@ -1117,7 +933,7 @@ def render_overview_tab(filtered: pd.DataFrame):
         margin={"l": 0, "r": 0, "t": 0, "b": 0},
         legend=dict(orientation="h", yanchor="bottom", y=0.99, x=0, xanchor="left"),
     )
-    st.plotly_chart(fig, width="stretch", config={"scrollZoom": True, "displayModeBar": False})
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": False})
     st.download_button(
         "Download map events",
         data=map_df.drop(columns=["event_story"], errors="ignore").to_csv(index=False).encode("utf-8"),
@@ -1138,7 +954,7 @@ def render_overview_tab(filtered: pd.DataFrame):
     else:
         line_fig = px.line(trend_df, x=trend_freq, y="events", markers=True)
         line_fig.update_layout(yaxis_title="Number of events", xaxis_title=trend_freq.title())
-        st.plotly_chart(line_fig, width="stretch")
+        st.plotly_chart(line_fig, use_container_width=True)
         st.download_button(
             "Download temporal trend",
             data=trend_df.to_csv(index=False).encode("utf-8"),
@@ -1153,16 +969,13 @@ def render_search_tab(
     semantic_vectorizer: TfidfVectorizer,
     semantic_matrix,
     semantic_index: dict,
-    context_vectorizer: TfidfVectorizer,
-    context_matrix,
-    context_index: dict,
 ):
-    st.subheader("Keyword search results")
-    if filter_state.keyword_filters:
-        st.write("Matching events for keywords:")
-        st.code(", ".join(filter_state.keyword_filters), language="text")
+    st.subheader("Text search results")
+    if filter_state.text_filters:
+        st.write("Matching events for search terms:")
+        st.code(", ".join(filter_state.text_filters), language="text")
     else:
-        st.info("Add keywords from the sidebar to search across notes, actors, and locations.")
+        st.info("Add text filters from the sidebar to search across notes, actors, and locations.")
 
     search_cols = [
         "event_id_cnty",
@@ -1238,52 +1051,7 @@ def render_search_tab(
             mime="text/csv",
         )
 
-    st.subheader("Contextual highlights")
-    context_summary = build_context_summary(filtered, context_matrix, context_index, context_vectorizer)
-    if context_summary.empty:
-        st.info("Contextual themes will appear once there is sufficient narrative information in the filtered events.")
-    else:
-        st.markdown(
-            "The table below surfaces the most salient note themes together with a representative event for each context."
-        )
-        st.dataframe(context_summary, width="stretch", hide_index=True)
-        st.download_button(
-            "Download contextual themes",
-            data=context_summary.to_csv(index=False).encode("utf-8"),
-            file_name="search_contextual_themes.csv",
-            mime="text/csv",
-        )
-
-    if filter_state.context_filters:
-        context_counts = (
-            filtered.assign(match_context=lambda x: x[NOTES_COL].str.lower())
-            .assign(
-                matches=lambda x: x["match_context"].apply(
-                    lambda txt: [ctx for ctx in filter_state.context_filters if ctx.lower() in txt]
-                )
-            )
-        )
-        context_filter_summary = (
-            context_counts.explode("matches")
-            .dropna(subset=["matches"])
-            .groupby("matches")
-            .agg(events=("event_id_cnty", "count"), fatalities=(FATALITIES_COL, "sum"))
-            .reset_index()
-            .rename(columns={"matches": "context"})
-            .sort_values("events", ascending=False)
-        )
-        if context_filter_summary.empty:
-            st.warning("No contextual matches found in the filtered events.")
-        else:
-            st.table(context_filter_summary)
-            st.download_button(
-                "Download context filter summary",
-                data=context_filter_summary.to_csv(index=False).encode("utf-8"),
-                file_name="search_context_filter_summary.csv",
-                mime="text/csv",
-            )
-    else:
-        st.info("Add context terms from the sidebar to analyse themes in the notes column.")
+    # Contextual highlights removed per user feedback.
 
 
 def render_clustering_tab(
@@ -1291,7 +1059,6 @@ def render_clustering_tab(
     context_matrix,
     context_index: dict,
     context_vectorizer: TfidfVectorizer,
-    all_notes: pd.Series,
 ):
     st.subheader("Cluster events by attributes")
     st.markdown(
@@ -1410,7 +1177,7 @@ def render_clustering_tab(
         opacity=0.85,
     )
     cluster_fig.update_layout(map_style="carto-positron", margin={"l": 0, "r": 0, "t": 0, "b": 0})
-    st.plotly_chart(cluster_fig, width="stretch", config={"scrollZoom": True, "displayModeBar": False})
+    st.plotly_chart(cluster_fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": False})
     st.download_button(
         "Download clustered events",
         data=clustered_df.to_csv(index=False).encode("utf-8"),
@@ -1461,138 +1228,15 @@ def render_clustering_tab(
         st.markdown(f"**Cluster {cluster_label}** — {len(group)} events")
         st.dataframe(spotlight, width="stretch", hide_index=True)
 
-    st.subheader("Language-guided narrative clustering")
-    st.markdown(
-        "Describe the conflict pattern you want to explore and the embedded language model will group the filtered events"
-        " around that description using the notes column."
-    )
-    st.caption(
-        "Example instruction: `Cluster events through different rebel groups in the dataset.` The model searches event notes"
-        " for the requested pattern before clustering similar narratives."
-    )
-
-    if SentenceTransformer is None:
-        st.info(
-            "Language-guided clustering requires the optional `sentence-transformers` dependency. Install it from the"
-            " requirements file to enable this feature."
-        )
-        return
-
-    language_prompt = st.text_area(
-        "Describe the pattern to cluster",
-        key="language_cluster_prompt",
-        placeholder="Cluster events through different rebel groups in the dataset.",
-        help="Explain the narrative focus. The notes column will be searched for matches before clustering similar events.",
-    )
-    language_cluster_count = st.slider(
-        "Number of language-guided clusters",
-        min_value=2,
-        max_value=6,
-        value=3,
-        key="language_cluster_count",
-    )
-    language_event_limit = st.slider(
-        "Maximum events to analyse",
-        min_value=60,
-        max_value=400,
-        value=200,
-        step=20,
-        key="language_event_limit",
-        help="Limits how many of the most relevant events are clustered to keep the narrative view focused.",
-    )
-    run_language_cluster = st.button(
-        "Generate language-guided clusters",
-        key="language_cluster_button",
-    )
-
-    note_embeddings = None
-    note_index_lookup = None
-    if run_language_cluster:
-        with st.spinner("Loading language model embeddings (first run may take up to a minute)..."):
-            note_embeddings, note_index_lookup = build_note_embeddings(all_notes)
-        if note_embeddings is None or note_index_lookup is None:
-            st.error(
-                "Language model embeddings are unavailable. Ensure `sentence-transformers` is installed and accessible."
-            )
-            return
-
-        result_df, status = language_guided_clustering(
-            filtered,
-            note_embeddings,
-            note_index_lookup,
-            language_prompt,
-            language_cluster_count,
-            max_events=language_event_limit,
-        )
-        if status == "model_unavailable":
-            st.error("Language model embeddings are unavailable. Ensure `sentence-transformers` is installed.")
-            return
-        if status == "empty_query":
-            st.warning("Provide an instruction so the language model knows what pattern to search for.")
-            return
-        if status == "no_embeddings":
-            st.warning("No narrative text is available for the filtered events, so language-guided clustering cannot run.")
-            return
-        if status == "no_similarity":
-            st.warning("The description did not match any event notes. Refine the instruction and try again.")
-            return
-        if status == "insufficient_events":
-            st.warning("Not enough events matched the description to form distinct clusters. Adjust the filters or prompt.")
-            return
-
-        st.success("Language-guided clustering complete.")
-        result_df = result_df.sort_values("similarity", ascending=False)
-        language_summary = result_df.groupby("cluster").agg(
-            events=("event_id_cnty", "count"),
-            mean_similarity=("similarity", "mean"),
-            mean_fatalities=(FATALITIES_COL, "mean"),
-        )
-        st.dataframe(language_summary, width="stretch")
-
-        theme_summary = summarise_cluster_contexts(
-            result_df,
-            context_matrix,
-            context_index,
-            context_vectorizer,
-        )
-        if not theme_summary.empty:
-            st.caption("Narrative keywords for each language-guided cluster:")
-            st.table(theme_summary.sort_values("cluster"))
-
-        st.caption("Representative events per language-guided cluster:")
-        for cluster_label, group in result_df.groupby("cluster"):
-            cluster_sample = group.sort_values("similarity", ascending=False).head(5)
-            display = cluster_sample[
-                [DATE_COL, COUNTRY_COL, ADMIN1_COL, ACTOR1_COL, EVENT_TYPE_COL, NOTES_COL, FATALITIES_COL, "similarity"]
-            ].copy()
-            display[DATE_COL] = pd.to_datetime(display[DATE_COL], errors="coerce").dt.strftime("%Y-%m-%d")
-            display[DATE_COL] = display[DATE_COL].fillna("Unknown")
-            display["location"] = (
-                display[[ADMIN1_COL, COUNTRY_COL]]
-                .astype(str)
-                .apply(lambda x: ", ".join([part for part in x if part and part != "nan"]), axis=1)
-            )
-            display["actor"] = display[ACTOR1_COL].fillna("Unknown actor")
-            display["event"] = display[EVENT_TYPE_COL].fillna("Unknown event")
-            display["fatalities"] = display[FATALITIES_COL].fillna(0).astype(int)
-            display["similarity"] = display["similarity"].round(3)
-            display["notes_excerpt"] = display[NOTES_COL].fillna("").apply(
-                lambda text: textwrap.shorten(str(text).strip(), width=140, placeholder="…")
-            )
-            table = display[
-                [DATE_COL, "location", "actor", "event", "fatalities", "similarity", "notes_excerpt"]
-            ]
-            st.markdown(f"**Language cluster {cluster_label}** — {len(group)} events")
-            st.dataframe(table, width="stretch", hide_index=True)
-
-
 def render_network_tab(filtered: pd.DataFrame):
-    st.subheader("Actor association network")
-    st.markdown("Construct a co-occurrence network from primary actors and their associated actors within events.")
+    st.subheader("Actor-category network")
+    st.markdown(
+        "Construct a bipartite network linking primary actors (`actor1`) with their ACLED actor categories (`inter1`)."
+    )
     st.caption(
-        "Nodes represent actors; edges are weighted by the number of events in which the pair co-occur. Node size follows"
-        " weighted degree centrality while node colour encodes the fatalities attributed to each actor across the filtered"
-        " events."
+        "Nodes represent either specific actors or actor categories. Edges are weighted by the number of events"
+        " connecting the pair. Node size reflects weighted degree centrality while colour encodes the fatalities"
+        " attributed to that actor or category across the filtered events."
     )
     event_count = len(filtered)
     if event_count < 10:
@@ -1601,45 +1245,40 @@ def render_network_tab(filtered: pd.DataFrame):
         )
         return
 
-    actor_values = pd.concat(
-        [
-            filtered.get(ACTOR1_COL, pd.Series(dtype=str)).fillna("").astype(str).str.strip(),
-            filtered.get(ASSOC_ACTOR1_COL, pd.Series(dtype=str)).fillna("").astype(str).str.strip(),
-        ],
-        ignore_index=True,
-    )
-    actor_values = actor_values[actor_values != ""]
-    if actor_values.empty or actor_values.value_counts().max() <= 1:
+    pair_df = filtered[[ACTOR1_COL, INTER1_COL, FATALITIES_COL]].copy()
+    pair_df[ACTOR1_COL] = pair_df[ACTOR1_COL].fillna("").astype(str).str.strip()
+    pair_df[INTER1_COL] = pair_df[INTER1_COL].fillna("").astype(str).str.strip()
+    pair_df = pair_df[(pair_df[ACTOR1_COL] != "") & (pair_df[INTER1_COL] != "")]
+    if pair_df.empty:
         st.warning(
-            "Actor overlaps are required to form edges, but no actor appears in more than one association within the selected"
-            " filters."
+            "Primary actor names and actor categories are required to generate the network, but the filtered events lack this information."
         )
         return
 
-    graph = build_actor_network(filtered)
+    graph = build_actor_network(pair_df)
     if graph.number_of_edges() == 0:
-        st.warning("Not enough actor association data to build a network for the selected filters.")
+        st.warning("Not enough actor-category links are available to build a network for the selected filters.")
         return
 
     degree_series = pd.Series(dict(graph.degree(weight="weight")))
     if degree_series.empty:
-        st.warning("Unable to determine actor centrality for the selected filters.")
+        st.warning("Unable to determine network centrality for the selected filters.")
         return
     max_nodes_available = int(degree_series.size)
     if max_nodes_available < 2:
-        st.warning("Not enough distinct actors to build a network for the selected filters.")
+        st.warning("Not enough distinct entities to build a network for the selected filters.")
         return
     slider_max = max_nodes_available
     slider_min = max(2, min(5, slider_max))
     if slider_min >= slider_max:
         top_n = slider_max
         st.caption(
-            f"Showing all {top_n} actors because the filtered dataset exposes only a limited number of participants."
+            f"Showing all {top_n} entities because the filtered dataset exposes only a limited number of participants."
         )
     else:
         slider_default = min(10, slider_max)
         top_n = st.slider(
-            "Show top actors",
+            "Show top entities",
             min_value=slider_min,
             max_value=slider_max,
             value=slider_default,
@@ -1647,7 +1286,7 @@ def render_network_tab(filtered: pd.DataFrame):
     top_nodes = degree_series.sort_values(ascending=False).head(top_n).index.tolist()
     subgraph = graph.subgraph(top_nodes).copy()
     if subgraph.number_of_nodes() == 0:
-        st.warning("No actor relationships available after applying the selected filters.")
+        st.warning("No actor-category relationships available after applying the selected filters.")
         return
     centrality = nx.degree_centrality(subgraph)
     weighted_degree = dict(subgraph.degree(weight="weight"))
@@ -1662,7 +1301,7 @@ def render_network_tab(filtered: pd.DataFrame):
             mode="lines",
             line=dict(width=0.8 + weight * 0.15, color="#bcd2e8"),
             hoverinfo="text",
-            text=f"{src} ↔ {dst}<br>Interactions: {weight}",
+            text=f"{src} ↔ {dst}<br>Events: {weight}",
         )
         edge_traces.append(edge_trace)
 
@@ -1672,6 +1311,8 @@ def render_network_tab(filtered: pd.DataFrame):
         [subgraph.nodes[node].get("fatalities", 0.0) for node in node_order], dtype=float
     )
     event_totals = np.array([subgraph.nodes[node].get("events", 0) for node in node_order], dtype=float)
+    centrality_values = np.array([centrality.get(node, 0.0) for node in node_order], dtype=float)
+    node_types = np.array([subgraph.nodes[node].get("node_type", "Actor") for node in node_order], dtype=object)
     if degree_values.size == 0:
         node_sizes = []
         node_colours = []
@@ -1690,10 +1331,11 @@ def render_network_tab(filtered: pd.DataFrame):
             colour_max = 1
     node_customdata = np.column_stack(
         [
-            [weighted_degree.get(node, 0) for node in node_order],
-            [centrality.get(node, 0.0) for node in node_order],
+            degree_values,
+            centrality_values,
             fatality_values,
             event_totals,
+            node_types,
         ]
     )
     node_trace = go.Scatter(
@@ -1715,7 +1357,8 @@ def render_network_tab(filtered: pd.DataFrame):
         ),
         customdata=node_customdata,
         hovertemplate=(
-            "<b>%{text}</b><br>Weighted degree: %{customdata[0]:.0f}"
+            "<b>%{text}</b><br>Role: %{customdata[4]}"
+            "<br>Weighted degree: %{customdata[0]:.0f}"
             "<br>Centrality: %{customdata[1]:.3f}"
             "<br>Attributed fatalities: %{customdata[2]:.0f}"
             "<br>Events observed: %{customdata[3]:.0f}<extra></extra>"
@@ -1731,14 +1374,15 @@ def render_network_tab(filtered: pd.DataFrame):
         margin=dict(l=40, r=40, t=60, b=40),
         plot_bgcolor="#f8fafc",
         paper_bgcolor="#f8fafc",
-        title=dict(text="Actor co-occurrence network", x=0.5, font=dict(size=16, color="#1f2937")),
+        title=dict(text="Actor-category interaction network", x=0.5, font=dict(size=16, color="#1f2937")),
     )
-    st.plotly_chart(network_fig, width="stretch", config={"displayModeBar": False})
+    st.plotly_chart(network_fig, use_container_width=True, config={"displayModeBar": False})
 
     centrality_df = (
         pd.DataFrame(
             {
-                "actor": list(subgraph.nodes()),
+                "entity": list(subgraph.nodes()),
+                "entity_type": [subgraph.nodes[node].get("node_type", "Actor") for node in subgraph.nodes()],
                 "weighted_degree": [weighted_degree.get(node, 0) for node in subgraph.nodes()],
                 "centrality": [centrality.get(node, 0) for node in subgraph.nodes()],
                 "attributed_fatalities": [subgraph.nodes[node].get("fatalities", 0) for node in subgraph.nodes()],
@@ -1756,14 +1400,27 @@ def render_network_tab(filtered: pd.DataFrame):
         mime="text/csv",
     )
 
-    edge_df = (
-        pd.DataFrame(
-            [
-                {"source": src, "target": dst, "weight": attrs.get("weight", 1)}
-                for src, dst, attrs in subgraph.edges(data=True)
-            ]
+    edge_rows: list[dict] = []
+    for src, dst, attrs in subgraph.edges(data=True):
+        weight = attrs.get("weight", 1)
+        src_type = subgraph.nodes[src].get("node_type", "Actor")
+        dst_type = subgraph.nodes[dst].get("node_type", "Actor")
+        if src_type == "Actor" and dst_type != "Actor":
+            actor_name, category_name = src, dst
+        elif dst_type == "Actor" and src_type != "Actor":
+            actor_name, category_name = dst, src
+        else:
+            actor_name, category_name = src, dst
+        edge_rows.append(
+            {
+                "actor": actor_name,
+                "actor_category": category_name,
+                "events": weight,
+            }
         )
-        .sort_values("weight", ascending=False)
+    edge_df = (
+        pd.DataFrame(edge_rows)
+        .sort_values("events", ascending=False)
         .reset_index(drop=True)
     )
     if not edge_df.empty:
@@ -1839,9 +1496,6 @@ def main():
             semantic_vectorizer,
             semantic_matrix,
             semantic_index,
-            context_vectorizer,
-            context_matrix,
-            context_index,
         )
     with cluster_tab:
         render_clustering_tab(
@@ -1849,7 +1503,6 @@ def main():
             context_matrix,
             context_index,
             context_vectorizer,
-            data[NOTES_COL],
         )
     with network_tab:
         render_network_tab(filtered)
