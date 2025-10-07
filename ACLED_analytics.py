@@ -1203,8 +1203,7 @@ def render_clustering_tab(
     context_matrix,
     context_index: dict,
     context_vectorizer: TfidfVectorizer,
-    note_embeddings,
-    note_index_lookup: dict | None,
+    all_notes: pd.Series,
 ):
     st.subheader("Cluster events by attributes")
     st.markdown(
@@ -1383,7 +1382,8 @@ def render_clustering_tab(
         "Example instruction: `Cluster events through different rebel groups in the dataset.` The model searches event notes"
         " for the requested pattern before clustering similar narratives."
     )
-    if note_embeddings is None or note_index_lookup is None:
+
+    if SentenceTransformer is None:
         st.info(
             "Language-guided clustering requires the optional `sentence-transformers` dependency. Install it from the"
             " requirements file to enable this feature."
@@ -1417,7 +1417,17 @@ def render_clustering_tab(
         key="language_cluster_button",
     )
 
+    note_embeddings = None
+    note_index_lookup = None
     if run_language_cluster:
+        with st.spinner("Loading language model embeddings (first run may take up to a minute)..."):
+            note_embeddings, note_index_lookup = build_note_embeddings(all_notes)
+        if note_embeddings is None or note_index_lookup is None:
+            st.error(
+                "Language model embeddings are unavailable. Ensure `sentence-transformers` is installed and accessible."
+            )
+            return
+
         result_df, status = language_guided_clustering(
             filtered,
             note_embeddings,
@@ -1708,7 +1718,6 @@ def main():
 
     semantic_vectorizer, semantic_matrix, semantic_index = build_semantic_index(data[NOTES_COL])
     context_vectorizer, context_matrix, context_index, _ = build_context_matrix(data[NOTES_COL])
-    note_embeddings, note_index_lookup = build_note_embeddings(data[NOTES_COL])
 
     filter_state = render_sidebar(data)
     filtered = apply_filters(data, filter_state)
@@ -1752,8 +1761,7 @@ def main():
             context_matrix,
             context_index,
             context_vectorizer,
-            note_embeddings,
-            note_index_lookup,
+            data[NOTES_COL],
         )
     with network_tab:
         render_network_tab(filtered)
