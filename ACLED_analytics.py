@@ -26,6 +26,10 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 import textwrap
 
+
+class DataLoadingError(RuntimeError):
+    """Raised when the ACLED source dataset cannot be loaded."""
+
 try:
     from sentence_transformers import SentenceTransformer
 except ImportError:  # pragma: no cover - optional dependency for language-guided clustering
@@ -96,22 +100,84 @@ GENERIC_CONTEXT_STOPWORDS = {
 # ---------------------------------------------------------------------------
 # Data loading & utilities
 # ---------------------------------------------------------------------------
+REQUIRED_COLUMNS = {DATE_COL, LAT_COL, LON_COL, NOTES_COL}
+
+
+def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Return the ACLED dataframe with consistent typing and derived columns."""
+
+    missing_columns = REQUIRED_COLUMNS.difference(df.columns)
+    if missing_columns:
+        raise DataLoadingError(
+            "Dataset is missing required columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    prepared = df.copy()
+    prepared[DATE_COL] = pd.to_datetime(prepared[DATE_COL], errors="coerce")
+    prepared[FATALITIES_COL] = pd.to_numeric(prepared[FATALITIES_COL], errors="coerce")
+    prepared[LAT_COL] = pd.to_numeric(prepared[LAT_COL], errors="coerce")
+    prepared[LON_COL] = pd.to_numeric(prepared[LON_COL], errors="coerce")
+    prepared = prepared.dropna(subset=[DATE_COL, LAT_COL, LON_COL])
+    prepared["year"] = prepared[DATE_COL].dt.year
+    prepared["month"] = prepared[DATE_COL].dt.to_period("M").astype(str)
+    prepared["week"] = prepared[DATE_COL].dt.to_period("W").astype(str)
+    prepared[NOTES_COL] = prepared[NOTES_COL].fillna("")
+    prepared[ACTOR1_COL] = prepared[ACTOR1_COL].fillna("Unknown actor")
+    prepared[ASSOC_ACTOR1_COL] = prepared[ASSOC_ACTOR1_COL].fillna("")
+    return prepared
+
+
+def _csv_candidates() -> list[Path]:
+    """Return ordered CSV fallbacks located alongside the app."""
+
+    parent = DATA_PATH.parent
+    primary_csv = DATA_PATH.with_suffix(".csv")
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    for path in [primary_csv, *sorted(parent.glob("*.csv"))]:
+        if path.exists() and path not in seen:
+            candidates.append(path)
+            seen.add(path)
+    return candidates
+
+
 @st.cache_data(show_spinner=False)
 def load_data() -> pd.DataFrame:
     """Load ACLED data from disk with typed columns."""
-    df = pd.read_excel(DATA_PATH)
-    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
-    df[FATALITIES_COL] = pd.to_numeric(df[FATALITIES_COL], errors="coerce")
-    df[LAT_COL] = pd.to_numeric(df[LAT_COL], errors="coerce")
-    df[LON_COL] = pd.to_numeric(df[LON_COL], errors="coerce")
-    df = df.dropna(subset=[DATE_COL, LAT_COL, LON_COL])
-    df["year"] = df[DATE_COL].dt.year
-    df["month"] = df[DATE_COL].dt.to_period("M").astype(str)
-    df["week"] = df[DATE_COL].dt.to_period("W").astype(str)
-    df[NOTES_COL] = df[NOTES_COL].fillna("")
-    df[ACTOR1_COL] = df[ACTOR1_COL].fillna("Unknown actor")
-    df[ASSOC_ACTOR1_COL] = df[ASSOC_ACTOR1_COL].fillna("")
-    return df
+
+    errors: list[str] = []
+
+    if DATA_PATH.exists():
+        try:
+            return _prepare_dataframe(pd.read_excel(DATA_PATH))
+        except ImportError as exc:
+            errors.append(
+                "Excel dataset present but optional dependency 'openpyxl' is not installed. "
+                "Install it with `pip install openpyxl` or provide a CSV export instead."
+            )
+        except DataLoadingError as exc:
+            errors.append(f"{DATA_PATH.name} is incompatible: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive guard
+            errors.append(f"Unable to read {DATA_PATH.name}: {exc}")
+
+    for csv_path in _csv_candidates():
+        try:
+            return _prepare_dataframe(pd.read_csv(csv_path))
+        except DataLoadingError as exc:
+            errors.append(f"{csv_path.name} is incompatible: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive guard
+            errors.append(f"Unable to read {csv_path.name}: {exc}")
+
+    error_message = "Unable to load the ACLED dataset."
+    if errors:
+        unique_errors = []
+        for message in errors:
+            if message not in unique_errors:
+                unique_errors.append(message)
+        error_message += "\n- " + "\n- ".join(unique_errors)
+    raise DataLoadingError(error_message)
 
 
 @st.cache_resource(show_spinner=False)
@@ -1629,7 +1695,17 @@ def main():
     st.title("ACLED Conflict Analytics Platform")
     st.caption("Explore geocoded events, discover patterns, and analyse conflict networks with the embedded ACLED dataset.")
 
-    data = load_data()
+    try:
+        data = load_data()
+    except DataLoadingError as exc:
+        st.error("Unable to load the ACLED dataset.")
+        st.markdown(
+            "Please ensure that the Excel file is accompanied by the optional `openpyxl` "
+            "dependency or place a CSV export of the dataset alongside the app file.\n\n"
+            f"**Details:** {exc}"
+        )
+        st.stop()
+
     semantic_vectorizer, semantic_matrix, semantic_index = build_semantic_index(data[NOTES_COL])
     context_vectorizer, context_matrix, context_index, _ = build_context_matrix(data[NOTES_COL])
     note_embeddings, note_index_lookup = build_note_embeddings(data[NOTES_COL])
