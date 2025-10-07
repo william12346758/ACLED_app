@@ -7,6 +7,7 @@ Author: LWu
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import itertools
 from pathlib import Path
 import re
@@ -39,6 +40,7 @@ except ImportError:  # pragma: no cover - optional dependency for language-guide
 # Configuration
 # ---------------------------------------------------------------------------
 DATA_PATH = Path(__file__).resolve().parent / "ACLED 2016-2025.xlsx"
+CACHE_PATH = Path(__file__).resolve().parent / "acled_dataset.pkl"
 DATE_COL = "event_date"
 LAT_COL = "latitude"
 LON_COL = "longitude"
@@ -51,7 +53,26 @@ FATALITIES_COL = "fatalities"
 ACTOR1_COL = "actor1"
 ASSOC_ACTOR1_COL = "assoc_actor_1"
 
+
+DATA_USE_COLUMNS = [
+    "event_id_cnty",
+    DATE_COL,
+    EVENT_TYPE_COL,
+    SUB_EVENT_COL,
+    ACTOR1_COL,
+    ASSOC_ACTOR1_COL,
+    COUNTRY_COL,
+    ADMIN1_COL,
+    LAT_COL,
+    LON_COL,
+    NOTES_COL,
+    FATALITIES_COL,
+]
+
 st.set_page_config(page_title="ACLED Conflict Analytics", layout="wide")
+
+
+logger = logging.getLogger(__name__)
 
 
 # Colour palettes
@@ -120,8 +141,8 @@ def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     prepared[LON_COL] = pd.to_numeric(prepared[LON_COL], errors="coerce")
     prepared = prepared.dropna(subset=[DATE_COL, LAT_COL, LON_COL])
     prepared["year"] = prepared[DATE_COL].dt.year
-    prepared["month"] = prepared[DATE_COL].dt.to_period("M").astype(str)
-    prepared["week"] = prepared[DATE_COL].dt.to_period("W").astype(str)
+    prepared["month"] = prepared[DATE_COL].dt.strftime("%Y-%m")
+    prepared["week"] = prepared[DATE_COL].dt.strftime("%Y-%W")
     prepared[NOTES_COL] = prepared[NOTES_COL].fillna("")
     prepared[ACTOR1_COL] = prepared[ACTOR1_COL].fillna("Unknown actor")
     prepared[ASSOC_ACTOR1_COL] = prepared[ASSOC_ACTOR1_COL].fillna("")
@@ -143,32 +164,86 @@ def _csv_candidates() -> list[Path]:
     return candidates
 
 
+def _load_cached_dataframe() -> pd.DataFrame | None:
+    """Return the cached ACLED dataframe if it is fresher than the source files."""
+
+    if not CACHE_PATH.exists():
+        return None
+
+    try:
+        cached = pd.read_pickle(CACHE_PATH)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.warning("Failed to read cached dataset %s: %s", CACHE_PATH.name, exc)
+        return None
+
+    if not isinstance(cached, pd.DataFrame):
+        logger.warning("Cached dataset %s is not a DataFrame.", CACHE_PATH.name)
+        return None
+
+    source_candidates = [DATA_PATH, *_csv_candidates()]
+    freshest_source_mtime: float | None = None
+    for candidate in source_candidates:
+        if candidate.exists():
+            try:
+                freshest_source_mtime = max(
+                    freshest_source_mtime or 0.0, candidate.stat().st_mtime
+                )
+            except OSError:
+                continue
+
+    try:
+        cache_mtime = CACHE_PATH.stat().st_mtime
+    except OSError:
+        return None
+
+    if freshest_source_mtime is None or cache_mtime >= freshest_source_mtime:
+        return cached.copy()
+
+    return None
+
+
+def _persist_cache(df: pd.DataFrame) -> None:
+    try:
+        df.to_pickle(CACHE_PATH)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.warning("Unable to update dataset cache %s: %s", CACHE_PATH.name, exc)
+
+
 @st.cache_data(show_spinner=False)
 def load_data() -> pd.DataFrame:
     """Load ACLED data from disk with typed columns."""
 
+    cached = _load_cached_dataframe()
+    if cached is not None:
+        return cached
+
     errors: list[str] = []
+    openpyxl_reported = False
 
-    if DATA_PATH.exists():
-        try:
-            return _prepare_dataframe(pd.read_excel(DATA_PATH))
-        except ImportError as exc:
-            errors.append(
-                "Excel dataset present but optional dependency 'openpyxl' is not installed. "
-                "Install it with `pip install openpyxl` or provide a CSV export instead."
-            )
-        except DataLoadingError as exc:
-            errors.append(f"{DATA_PATH.name} is incompatible: {exc}")
-        except Exception as exc:  # pragma: no cover - defensive guard
-            errors.append(f"Unable to read {DATA_PATH.name}: {exc}")
+    for source_path in [DATA_PATH, *_csv_candidates()]:
+        if not source_path.exists():
+            continue
 
-    for csv_path in _csv_candidates():
         try:
-            return _prepare_dataframe(pd.read_csv(csv_path))
+            usecols = list(dict.fromkeys(DATA_USE_COLUMNS))
+            if source_path.suffix.lower() == ".xlsx":
+                raw = pd.read_excel(source_path, usecols=usecols)
+            else:
+                raw = pd.read_csv(source_path, usecols=usecols)
+            prepared = _prepare_dataframe(raw)
+            _persist_cache(prepared)
+            return prepared
+        except ImportError:
+            if not openpyxl_reported:
+                errors.append(
+                    "Excel dataset present but optional dependency 'openpyxl' is not installed. "
+                    "Install it with `pip install openpyxl` or provide a CSV export instead."
+                )
+                openpyxl_reported = True
         except DataLoadingError as exc:
-            errors.append(f"{csv_path.name} is incompatible: {exc}")
+            errors.append(f"{source_path.name} is incompatible: {exc}")
         except Exception as exc:  # pragma: no cover - defensive guard
-            errors.append(f"Unable to read {csv_path.name}: {exc}")
+            errors.append(f"Unable to read {source_path.name}: {exc}")
 
     error_message = "Unable to load the ACLED dataset."
     if errors:
@@ -240,9 +315,22 @@ def load_sentence_model():
     if SentenceTransformer is None:
         return None
     try:
-        return SentenceTransformer("all-MiniLM-L6-v2")
-    except Exception:
-        return None
+        candidate_models = [
+            "sentence-transformers/paraphrase-MiniLM-L3-v2",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        ]
+        errors: list[str] = []
+        for model_name in candidate_models:
+            try:
+                return SentenceTransformer(model_name)
+            except Exception as exc:  # pragma: no cover - best-effort fallback
+                errors.append(f"{model_name}: {exc}")
+                logger.warning("Unable to load sentence transformer '%s': %s", model_name, exc)
+        if errors:
+            logger.warning("All candidate sentence transformers failed to load: %s", "; ".join(errors))
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.warning("Unexpected error while loading sentence transformer: %s", exc)
+    return None
 
 
 @st.cache_resource(show_spinner=False)
@@ -1007,7 +1095,7 @@ def render_overview_tab(filtered: pd.DataFrame):
             "size_max": 14,
         }
 
-    fig = px.scatter_mapbox(
+    fig = px.scatter_map(
         map_df,
         lat=LAT_COL,
         lon=LON_COL,
@@ -1025,11 +1113,11 @@ def render_overview_tab(filtered: pd.DataFrame):
     marker_style.setdefault("sizemin", 3)
     fig.update_traces(hovertemplate="%{customdata[0]}<extra></extra>", marker=marker_style)
     fig.update_layout(
-        mapbox_style="carto-positron",
+        map_style="carto-positron",
         margin={"l": 0, "r": 0, "t": 0, "b": 0},
         legend=dict(orientation="h", yanchor="bottom", y=0.99, x=0, xanchor="left"),
     )
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": False})
+    st.plotly_chart(fig, width="stretch", config={"scrollZoom": True, "displayModeBar": False})
     st.download_button(
         "Download map events",
         data=map_df.drop(columns=["event_story"], errors="ignore").to_csv(index=False).encode("utf-8"),
@@ -1050,7 +1138,7 @@ def render_overview_tab(filtered: pd.DataFrame):
     else:
         line_fig = px.line(trend_df, x=trend_freq, y="events", markers=True)
         line_fig.update_layout(yaxis_title="Number of events", xaxis_title=trend_freq.title())
-        st.plotly_chart(line_fig, use_container_width=True)
+        st.plotly_chart(line_fig, width="stretch")
         st.download_button(
             "Download temporal trend",
             data=trend_df.to_csv(index=False).encode("utf-8"),
@@ -1091,7 +1179,7 @@ def render_search_tab(
     if keyword_results.empty:
         st.warning("No keyword results available for the current filters.")
     else:
-        st.dataframe(keyword_results.head(200), use_container_width=True, hide_index=True)
+        st.dataframe(keyword_results.head(200), width="stretch", hide_index=True)
         st.download_button(
             "Download keyword matches",
             data=keyword_results.to_csv(index=False).encode("utf-8"),
@@ -1136,7 +1224,7 @@ def render_search_tab(
                         NOTES_COL,
                     ]
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
     else:
@@ -1158,7 +1246,7 @@ def render_search_tab(
         st.markdown(
             "The table below surfaces the most salient note themes together with a representative event for each context."
         )
-        st.dataframe(context_summary, use_container_width=True, hide_index=True)
+        st.dataframe(context_summary, width="stretch", hide_index=True)
         st.download_button(
             "Download contextual themes",
             data=context_summary.to_csv(index=False).encode("utf-8"),
@@ -1287,7 +1375,7 @@ def render_clustering_tab(
         events=("event_id_cnty", "count"),
         mean_fatalities=(FATALITIES_COL, "mean"),
     )
-    st.dataframe(cluster_counts, use_container_width=True)
+    st.dataframe(cluster_counts, width="stretch")
     st.download_button(
         "Download cluster summary",
         data=cluster_counts.to_csv().encode("utf-8"),
@@ -1304,7 +1392,7 @@ def render_clustering_tab(
             "color_discrete_map": cluster_colour_map,
             "category_orders": {"cluster": list(cluster_colour_map.keys())},
         }
-    cluster_fig = px.scatter_mapbox(
+    cluster_fig = px.scatter_map(
         cluster_display,
         lat=LAT_COL,
         lon=LON_COL,
@@ -1321,8 +1409,8 @@ def render_clustering_tab(
         marker=dict(size=7),
         opacity=0.85,
     )
-    cluster_fig.update_layout(mapbox_style="carto-positron", margin={"l": 0, "r": 0, "t": 0, "b": 0})
-    st.plotly_chart(cluster_fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": False})
+    cluster_fig.update_layout(map_style="carto-positron", margin={"l": 0, "r": 0, "t": 0, "b": 0})
+    st.plotly_chart(cluster_fig, width="stretch", config={"scrollZoom": True, "displayModeBar": False})
     st.download_button(
         "Download clustered events",
         data=clustered_df.to_csv(index=False).encode("utf-8"),
@@ -1338,7 +1426,7 @@ def render_clustering_tab(
         st.caption(
             "TF-IDF themes from the notes column are aggregated per cluster to clarify how narratives differ between groups."
         )
-        st.dataframe(cluster_theme_summary.sort_values("cluster"), use_container_width=True, hide_index=True)
+        st.dataframe(cluster_theme_summary.sort_values("cluster"), width="stretch", hide_index=True)
         st.download_button(
             "Download cluster theme summary",
             data=cluster_theme_summary.to_csv(index=False).encode("utf-8"),
@@ -1371,7 +1459,7 @@ def render_clustering_tab(
         )
         spotlight = display[[DATE_COL, "location", "actor", "event", "fatalities", "notes_excerpt"]]
         st.markdown(f"**Cluster {cluster_label}** — {len(group)} events")
-        st.dataframe(spotlight, use_container_width=True, hide_index=True)
+        st.dataframe(spotlight, width="stretch", hide_index=True)
 
     st.subheader("Language-guided narrative clustering")
     st.markdown(
@@ -1459,7 +1547,7 @@ def render_clustering_tab(
             mean_similarity=("similarity", "mean"),
             mean_fatalities=(FATALITIES_COL, "mean"),
         )
-        st.dataframe(language_summary, use_container_width=True)
+        st.dataframe(language_summary, width="stretch")
 
         theme_summary = summarise_cluster_contexts(
             result_df,
@@ -1495,7 +1583,7 @@ def render_clustering_tab(
                 [DATE_COL, "location", "actor", "event", "fatalities", "similarity", "notes_excerpt"]
             ]
             st.markdown(f"**Language cluster {cluster_label}** — {len(group)} events")
-            st.dataframe(table, use_container_width=True, hide_index=True)
+            st.dataframe(table, width="stretch", hide_index=True)
 
 
 def render_network_tab(filtered: pd.DataFrame):
@@ -1645,7 +1733,7 @@ def render_network_tab(filtered: pd.DataFrame):
         paper_bgcolor="#f8fafc",
         title=dict(text="Actor co-occurrence network", x=0.5, font=dict(size=16, color="#1f2937")),
     )
-    st.plotly_chart(network_fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(network_fig, width="stretch", config={"displayModeBar": False})
 
     centrality_df = (
         pd.DataFrame(
@@ -1689,7 +1777,7 @@ def render_network_tab(filtered: pd.DataFrame):
 
 def render_data_tab(filtered: pd.DataFrame):
     st.subheader("Filtered dataset")
-    st.dataframe(filtered, use_container_width=True)
+    st.dataframe(filtered, width="stretch")
     st.download_button(
         "Download filtered data",
         data=filtered.to_csv(index=False).encode("utf-8"),
