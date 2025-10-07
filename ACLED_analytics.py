@@ -26,10 +26,15 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 import textwrap
 
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:  # pragma: no cover - optional dependency for language-guided clustering
+    SentenceTransformer = None
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATA_PATH = Path(__file__).resolve().parent / "ACLED 2024-2025.csv"
+DATA_PATH = Path(__file__).resolve().parent / "ACLED 2016-2025.xlsx"
 DATE_COL = "event_date"
 LAT_COL = "latitude"
 LON_COL = "longitude"
@@ -56,13 +61,45 @@ QUALITATIVE_SCHEMES = {
 }
 
 
+MONTH_TERMS = {
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+}
+
+
+GENERIC_CONTEXT_STOPWORDS = {
+    "according",
+    "alleged",
+    "authorities",
+    "community",
+    "district",
+    "local",
+    "reported",
+    "residents",
+    "security",
+    "said",
+    "state",
+    "villagers",
+}
+
+
 # ---------------------------------------------------------------------------
 # Data loading & utilities
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_data() -> pd.DataFrame:
     """Load ACLED data from disk with typed columns."""
-    df = pd.read_csv(DATA_PATH, encoding="utf-8-sig", low_memory=False)
+    df = pd.read_excel(DATA_PATH)
     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
     df[FATALITIES_COL] = pd.to_numeric(df[FATALITIES_COL], errors="coerce")
     df[LAT_COL] = pd.to_numeric(df[LAT_COL], errors="coerce")
@@ -96,6 +133,149 @@ def build_context_matrix(notes: pd.Series):
     index_lookup = {idx: position for position, idx in enumerate(prepared_notes.index)}
     feature_names = vectorizer.get_feature_names_out()
     return vectorizer, matrix, index_lookup, feature_names
+
+
+def is_conflict_term(term: str) -> bool:
+    """Return True when a TF-IDF term is conflict-specific rather than temporal."""
+    normalised = term.lower().replace("_", " ")
+    parts = [token for token in re.split(r"[\s\-/]+", normalised) if token]
+    if not parts:
+        return False
+    for token in parts:
+        if any(char.isdigit() for char in token):
+            return False
+        if token in MONTH_TERMS:
+            return False
+        if len(token) <= 2:
+            return False
+    if all(token in GENERIC_CONTEXT_STOPWORDS for token in parts):
+        return False
+    return True
+
+
+def select_top_term_indices(term_strength: np.ndarray, feature_names: np.ndarray, limit: int) -> list[int]:
+    """Return indices of the strongest conflict-relevant TF-IDF terms."""
+    sorted_indices = term_strength.argsort()[::-1]
+    selected: list[int] = []
+    for idx in sorted_indices:
+        if term_strength[idx] <= 0:
+            continue
+        term = feature_names[idx]
+        if not is_conflict_term(term):
+            continue
+        selected.append(idx)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+@st.cache_resource(show_spinner=False)
+def load_sentence_model():
+    if SentenceTransformer is None:
+        return None
+    try:
+        return SentenceTransformer("all-MiniLM-L6-v2")
+    except Exception:
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def build_note_embeddings(notes: pd.Series):
+    model = load_sentence_model()
+    if model is None:
+        return None, None
+    prepared_notes = notes.fillna("").astype(str)
+    try:
+        embeddings = model.encode(
+            prepared_notes.tolist(),
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+    except TypeError:
+        embeddings = model.encode(
+            prepared_notes.tolist(),
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+        # Normalise manually if the library version does not support the parameter.
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        embeddings = embeddings / norms
+    index_lookup = {idx: position for position, idx in enumerate(prepared_notes.index)}
+    return embeddings, index_lookup
+
+
+def align_embeddings(df: pd.DataFrame, embeddings, index_lookup: dict):
+    if embeddings is None or index_lookup is None:
+        return None, None
+    subset_positions: list[tuple[int, int]] = []
+    for df_position, idx in enumerate(df.index):
+        matrix_position = index_lookup.get(idx)
+        if matrix_position is not None:
+            subset_positions.append((df_position, matrix_position))
+    if not subset_positions:
+        return None, None
+    df_positions, matrix_positions = map(np.array, zip(*subset_positions))
+    subset_embeddings = embeddings[matrix_positions]
+    return subset_embeddings, df_positions
+
+
+def language_guided_clustering(
+    df: pd.DataFrame,
+    note_embeddings,
+    note_index_lookup: dict,
+    query: str,
+    cluster_count: int,
+    max_events: int = 250,
+):
+    """Cluster events guided by a natural-language query using sentence-transformer embeddings."""
+    model = load_sentence_model()
+    if model is None:
+        return None, "model_unavailable"
+    query = query.strip()
+    if not query:
+        return None, "empty_query"
+    subset_embeddings, df_positions = align_embeddings(df, note_embeddings, note_index_lookup)
+    if subset_embeddings is None:
+        return None, "no_embeddings"
+    try:
+        query_embedding = model.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
+    except TypeError:
+        query_embedding = model.encode([query], show_progress_bar=False, convert_to_numpy=True)[0]
+        norm = np.linalg.norm(query_embedding)
+        if norm > 0:
+            query_embedding = query_embedding / norm
+    similarities = subset_embeddings @ query_embedding
+    if not np.any(similarities > 0):
+        return None, "no_similarity"
+
+    order = np.argsort(similarities)[::-1][:max_events]
+    ordered_scores = similarities[order]
+    positive_mask = ordered_scores > 0.05
+    selected_indices = order[positive_mask]
+    if selected_indices.size < cluster_count * 2:
+        broader_mask = ordered_scores > 0
+        selected_indices = order[broader_mask]
+    if selected_indices.size < cluster_count * 2:
+        return None, "insufficient_events"
+
+    selected_embeddings = subset_embeddings[selected_indices]
+    selected_positions = df_positions[selected_indices]
+    selected_df = df.iloc[selected_positions].copy()
+    selected_df["similarity"] = similarities[selected_indices]
+
+    adjusted_clusters = min(cluster_count, max(2, selected_df.shape[0] // 3))
+    if adjusted_clusters < 2 or selected_df.shape[0] < adjusted_clusters:
+        return None, "insufficient_events"
+
+    try:
+        model_kmeans = KMeans(n_clusters=adjusted_clusters, random_state=42, n_init="auto")
+    except TypeError:
+        model_kmeans = KMeans(n_clusters=adjusted_clusters, random_state=42, n_init=10)
+    labels = model_kmeans.fit_predict(selected_embeddings)
+    selected_df["cluster"] = labels.astype(str)
+    return selected_df, "ok"
 
 
 def build_colour_mapping(df: pd.DataFrame, column: str, palette_key: str | None = None) -> dict:
@@ -323,7 +503,9 @@ def build_context_summary(
         return pd.DataFrame()
 
     feature_names = context_vectorizer.get_feature_names_out()
-    top_indices = term_strength.argsort()[::-1][:top_terms]
+    top_indices = select_top_term_indices(term_strength, feature_names, top_terms)
+    if not top_indices:
+        return pd.DataFrame()
 
     rows: list[dict] = []
     for term_idx in top_indices:
@@ -377,8 +559,8 @@ def summarise_cluster_contexts(
         if not np.any(term_strength):
             continue
         feature_names = context_vectorizer.get_feature_names_out()
-        top_indices = term_strength.argsort()[::-1][:top_terms]
-        top_terms_list = [feature_names[idx] for idx in top_indices if term_strength[idx] > 0]
+        top_indices = select_top_term_indices(term_strength, feature_names, top_terms)
+        top_terms_list = [feature_names[idx] for idx in top_indices]
         summaries.append(
             {
                 "cluster": str(cluster_label),
@@ -427,14 +609,17 @@ def craft_event_story(row: pd.Series) -> str:
 def build_actor_network(df: pd.DataFrame) -> nx.Graph:
     graph = nx.Graph()
     for _, row in df.iterrows():
-        actor = row.get(ACTOR1_COL)
-        assoc = row.get(ASSOC_ACTOR1_COL)
+        actor = str(row.get(ACTOR1_COL) or "").strip()
+        assoc = str(row.get(ASSOC_ACTOR1_COL) or "").strip()
         if not actor or not assoc:
             continue
-        actor = actor.strip()
-        assoc = assoc.strip()
-        if not actor or not assoc:
-            continue
+        fatalities_value = row.get(FATALITIES_COL)
+        fatality = float(fatalities_value) if pd.notnull(fatalities_value) else 0.0
+        for node in (actor, assoc):
+            if not graph.has_node(node):
+                graph.add_node(node, fatalities=0.0, events=0)
+            graph.nodes[node]["fatalities"] += fatality
+            graph.nodes[node]["events"] += 1
         if graph.has_edge(actor, assoc):
             graph[actor][assoc]["weight"] += 1
         else:
@@ -540,7 +725,7 @@ def render_sidebar(data: pd.DataFrame) -> FilterState:
 
         default_range = (min_date, max_date)
         if pd.notnull(min_date_raw) and pd.notnull(max_date_raw):
-            recent_start = max_date_raw - pd.DateOffset(months=3)
+            recent_start = max_date_raw - pd.DateOffset(months=6)
             if pd.notnull(recent_start):
                 bounded_start = max(recent_start, min_date_raw)
                 default_range = (bounded_start.date(), max_date)
@@ -647,6 +832,58 @@ def apply_filters(df: pd.DataFrame, state: FilterState) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# High-level summaries
+# ---------------------------------------------------------------------------
+def render_filter_summary(filtered: pd.DataFrame, state: FilterState) -> None:
+    """Display high-level context about the active filters and dataset."""
+
+    total_events = int(len(filtered))
+    fatalities_total = 0
+    if FATALITIES_COL in filtered.columns:
+        fatalities_total = int(filtered[FATALITIES_COL].fillna(0).sum())
+
+    unique_countries = 0
+    if COUNTRY_COL in filtered.columns:
+        unique_countries = int(filtered[COUNTRY_COL].dropna().nunique())
+
+    unique_actors = 0
+    if ACTOR1_COL in filtered.columns:
+        unique_actors = int(filtered[ACTOR1_COL].dropna().nunique())
+
+    date_range_text = ""
+    if state.date_range and len(state.date_range) == 2:
+        start_ts = pd.to_datetime(state.date_range[0])
+        end_ts = pd.to_datetime(state.date_range[1])
+        if pd.notnull(start_ts) and pd.notnull(end_ts):
+            if start_ts > end_ts:
+                start_ts, end_ts = end_ts, start_ts
+            date_range_text = f"Active date range: {start_ts.date()} to {end_ts.date()}"
+
+    top_country_summary = ""
+    if COUNTRY_COL in filtered.columns and total_events:
+        top_countries = (
+            filtered[COUNTRY_COL]
+            .dropna()
+            .astype(str)
+            .value_counts()
+            .head(3)
+            .index.tolist()
+        )
+        if top_countries:
+            top_country_summary = "Top countries: " + ", ".join(top_countries)
+
+    event_col, fatality_col, country_col, actor_col = st.columns(4)
+    event_col.metric("Events", f"{total_events:,}")
+    fatality_col.metric("Reported fatalities", f"{fatalities_total:,}")
+    country_col.metric("Countries", f"{unique_countries:,}")
+    actor_col.metric("Primary actors", f"{unique_actors:,}")
+
+    caption_parts = [part for part in [date_range_text, top_country_summary] if part]
+    if caption_parts:
+        st.caption(" · ".join(caption_parts))
+
+
+# ---------------------------------------------------------------------------
 # Rendering helpers
 # ---------------------------------------------------------------------------
 def render_landing_tab():
@@ -654,7 +891,9 @@ def render_landing_tab():
     st.markdown(
         """
         Welcome to the ACLED Conflict Analytics Platform. The application preloads the curated
-        ACLED dataset bundled with this tool, so you can begin exploring immediately.
+        ACLED dataset bundled with this tool, so you can begin exploring immediately. By default the
+        global filters display the latest six months of activity, ensuring the landing view highlights
+        the most recent conflict dynamics.
 
         **How to navigate the app**
 
@@ -898,6 +1137,8 @@ def render_clustering_tab(
     context_matrix,
     context_index: dict,
     context_vectorizer: TfidfVectorizer,
+    note_embeddings,
+    note_index_lookup: dict | None,
 ):
     st.subheader("Cluster events by attributes")
     st.markdown(
@@ -1040,14 +1281,177 @@ def render_clustering_tab(
             mime="text/csv",
         )
 
+    st.subheader("Cluster spotlights")
+    st.caption("A concise sample of events from each cluster highlights how the groups differ in practice.")
+    for cluster_label, group in clustered_df.groupby("cluster"):
+        sample = group.copy()
+        if FATALITIES_COL in sample.columns:
+            sample = sample.sort_values(FATALITIES_COL, ascending=False)
+        sample = sample.head(5)
+        if sample.empty:
+            continue
+        display = sample[[DATE_COL, COUNTRY_COL, ADMIN1_COL, ACTOR1_COL, EVENT_TYPE_COL, NOTES_COL, FATALITIES_COL]].copy()
+        display[DATE_COL] = pd.to_datetime(display[DATE_COL], errors="coerce").dt.strftime("%Y-%m-%d")
+        display[DATE_COL] = display[DATE_COL].fillna("Unknown")
+        display["location"] = (
+            display[[ADMIN1_COL, COUNTRY_COL]]
+            .astype(str)
+            .apply(lambda x: ", ".join([part for part in x if part and part != "nan"]), axis=1)
+        )
+        display["actor"] = display[ACTOR1_COL].fillna("Unknown actor")
+        display["event"] = display[EVENT_TYPE_COL].fillna("Unknown event")
+        display["fatalities"] = display[FATALITIES_COL].fillna(0).astype(int)
+        display["notes_excerpt"] = display[NOTES_COL].fillna("").apply(
+            lambda text: textwrap.shorten(str(text).strip(), width=140, placeholder="…")
+        )
+        spotlight = display[[DATE_COL, "location", "actor", "event", "fatalities", "notes_excerpt"]]
+        st.markdown(f"**Cluster {cluster_label}** — {len(group)} events")
+        st.dataframe(spotlight, use_container_width=True, hide_index=True)
+
+    st.subheader("Language-guided narrative clustering")
+    st.markdown(
+        "Describe the conflict pattern you want to explore and the embedded language model will group the filtered events"
+        " around that description using the notes column."
+    )
+    st.caption(
+        "Example instruction: `Cluster events through different rebel groups in the dataset.` The model searches event notes"
+        " for the requested pattern before clustering similar narratives."
+    )
+    if note_embeddings is None or note_index_lookup is None:
+        st.info(
+            "Language-guided clustering requires the optional `sentence-transformers` dependency. Install it from the"
+            " requirements file to enable this feature."
+        )
+        return
+
+    language_prompt = st.text_area(
+        "Describe the pattern to cluster",
+        key="language_cluster_prompt",
+        placeholder="Cluster events through different rebel groups in the dataset.",
+        help="Explain the narrative focus. The notes column will be searched for matches before clustering similar events.",
+    )
+    language_cluster_count = st.slider(
+        "Number of language-guided clusters",
+        min_value=2,
+        max_value=6,
+        value=3,
+        key="language_cluster_count",
+    )
+    language_event_limit = st.slider(
+        "Maximum events to analyse",
+        min_value=60,
+        max_value=400,
+        value=200,
+        step=20,
+        key="language_event_limit",
+        help="Limits how many of the most relevant events are clustered to keep the narrative view focused.",
+    )
+    run_language_cluster = st.button(
+        "Generate language-guided clusters",
+        key="language_cluster_button",
+    )
+
+    if run_language_cluster:
+        result_df, status = language_guided_clustering(
+            filtered,
+            note_embeddings,
+            note_index_lookup,
+            language_prompt,
+            language_cluster_count,
+            max_events=language_event_limit,
+        )
+        if status == "model_unavailable":
+            st.error("Language model embeddings are unavailable. Ensure `sentence-transformers` is installed.")
+            return
+        if status == "empty_query":
+            st.warning("Provide an instruction so the language model knows what pattern to search for.")
+            return
+        if status == "no_embeddings":
+            st.warning("No narrative text is available for the filtered events, so language-guided clustering cannot run.")
+            return
+        if status == "no_similarity":
+            st.warning("The description did not match any event notes. Refine the instruction and try again.")
+            return
+        if status == "insufficient_events":
+            st.warning("Not enough events matched the description to form distinct clusters. Adjust the filters or prompt.")
+            return
+
+        st.success("Language-guided clustering complete.")
+        result_df = result_df.sort_values("similarity", ascending=False)
+        language_summary = result_df.groupby("cluster").agg(
+            events=("event_id_cnty", "count"),
+            mean_similarity=("similarity", "mean"),
+            mean_fatalities=(FATALITIES_COL, "mean"),
+        )
+        st.dataframe(language_summary, use_container_width=True)
+
+        theme_summary = summarise_cluster_contexts(
+            result_df,
+            context_matrix,
+            context_index,
+            context_vectorizer,
+        )
+        if not theme_summary.empty:
+            st.caption("Narrative keywords for each language-guided cluster:")
+            st.table(theme_summary.sort_values("cluster"))
+
+        st.caption("Representative events per language-guided cluster:")
+        for cluster_label, group in result_df.groupby("cluster"):
+            cluster_sample = group.sort_values("similarity", ascending=False).head(5)
+            display = cluster_sample[
+                [DATE_COL, COUNTRY_COL, ADMIN1_COL, ACTOR1_COL, EVENT_TYPE_COL, NOTES_COL, FATALITIES_COL, "similarity"]
+            ].copy()
+            display[DATE_COL] = pd.to_datetime(display[DATE_COL], errors="coerce").dt.strftime("%Y-%m-%d")
+            display[DATE_COL] = display[DATE_COL].fillna("Unknown")
+            display["location"] = (
+                display[[ADMIN1_COL, COUNTRY_COL]]
+                .astype(str)
+                .apply(lambda x: ", ".join([part for part in x if part and part != "nan"]), axis=1)
+            )
+            display["actor"] = display[ACTOR1_COL].fillna("Unknown actor")
+            display["event"] = display[EVENT_TYPE_COL].fillna("Unknown event")
+            display["fatalities"] = display[FATALITIES_COL].fillna(0).astype(int)
+            display["similarity"] = display["similarity"].round(3)
+            display["notes_excerpt"] = display[NOTES_COL].fillna("").apply(
+                lambda text: textwrap.shorten(str(text).strip(), width=140, placeholder="…")
+            )
+            table = display[
+                [DATE_COL, "location", "actor", "event", "fatalities", "similarity", "notes_excerpt"]
+            ]
+            st.markdown(f"**Language cluster {cluster_label}** — {len(group)} events")
+            st.dataframe(table, use_container_width=True, hide_index=True)
+
 
 def render_network_tab(filtered: pd.DataFrame):
     st.subheader("Actor association network")
     st.markdown("Construct a co-occurrence network from primary actors and their associated actors within events.")
     st.caption(
-        "Nodes represent actors; edges are weighted by the number of events in which the pair co-occur. Node colour and size"
-        " scale with weighted degree centrality."
+        "Nodes represent actors; edges are weighted by the number of events in which the pair co-occur. Node size follows"
+        " weighted degree centrality while node colour encodes the fatalities attributed to each actor across the filtered"
+        " events."
     )
+    event_count = len(filtered)
+    if event_count < 10:
+        st.info(
+            f"At least 10 events are required to render the actor network. Only {event_count} events match the current filters."
+        )
+        return
+
+    actor_values = pd.concat(
+        [
+            filtered.get(ACTOR1_COL, pd.Series(dtype=str)).fillna("").astype(str).str.strip(),
+            filtered.get(ASSOC_ACTOR1_COL, pd.Series(dtype=str)).fillna("").astype(str).str.strip(),
+        ],
+        ignore_index=True,
+    )
+    actor_values = actor_values[actor_values != ""]
+    if actor_values.empty or actor_values.value_counts().max() <= 1:
+        st.warning(
+            "Actor overlaps are required to form edges, but no actor appears in more than one association within the selected"
+            " filters."
+        )
+        return
+
     graph = build_actor_network(filtered)
     if graph.number_of_edges() == 0:
         st.warning("Not enough actor association data to build a network for the selected filters.")
@@ -1061,14 +1465,21 @@ def render_network_tab(filtered: pd.DataFrame):
     if max_nodes_available < 2:
         st.warning("Not enough distinct actors to build a network for the selected filters.")
         return
-    slider_min = min(5, max_nodes_available)
-    slider_default = min(10, max_nodes_available)
-    top_n = st.slider(
-        "Show top actors",
-        min_value=slider_min,
-        max_value=max_nodes_available,
-        value=slider_default,
-    )
+    slider_max = max_nodes_available
+    slider_min = max(2, min(5, slider_max))
+    if slider_min >= slider_max:
+        top_n = slider_max
+        st.caption(
+            f"Showing all {top_n} actors because the filtered dataset exposes only a limited number of participants."
+        )
+    else:
+        slider_default = min(10, slider_max)
+        top_n = st.slider(
+            "Show top actors",
+            min_value=slider_min,
+            max_value=slider_max,
+            value=slider_default,
+        )
     top_nodes = degree_series.sort_values(ascending=False).head(top_n).index.tolist()
     subgraph = graph.subgraph(top_nodes).copy()
     if subgraph.number_of_nodes() == 0:
@@ -1093,6 +1504,10 @@ def render_network_tab(filtered: pd.DataFrame):
 
     node_order = list(subgraph.nodes())
     degree_values = np.array([weighted_degree.get(node, 0) for node in node_order], dtype=float)
+    fatality_values = np.array(
+        [subgraph.nodes[node].get("fatalities", 0.0) for node in node_order], dtype=float
+    )
+    event_totals = np.array([subgraph.nodes[node].get("events", 0) for node in node_order], dtype=float)
     if degree_values.size == 0:
         node_sizes = []
         node_colours = []
@@ -1105,12 +1520,16 @@ def render_network_tab(filtered: pd.DataFrame):
         else:
             scaled = np.sqrt(degree_values / max_degree)
         node_sizes = (min_size + (max_size - min_size) * scaled).tolist()
-        node_colours = degree_values.tolist()
-        colour_max = max_degree if max_degree > 0 else 1
+        node_colours = fatality_values.tolist()
+        colour_max = float(fatality_values.max()) if fatality_values.size else 1
+        if colour_max <= 0:
+            colour_max = 1
     node_customdata = np.column_stack(
         [
             [weighted_degree.get(node, 0) for node in node_order],
             [centrality.get(node, 0.0) for node in node_order],
+            fatality_values,
+            event_totals,
         ]
     )
     node_trace = go.Scatter(
@@ -1123,15 +1542,20 @@ def render_network_tab(filtered: pd.DataFrame):
         marker=dict(
             size=node_sizes,
             color=node_colours,
-            colorscale="Blues",
+            colorscale="Reds",
             cmin=0,
             cmax=colour_max,
             showscale=True,
-            colorbar=dict(title="Weighted degree"),
+            colorbar=dict(title="Attributed fatalities"),
             line=dict(width=1.2, color="#f8fafc"),
         ),
         customdata=node_customdata,
-        hovertemplate="<b>%{text}</b><br>Weighted degree: %{customdata[0]:.0f}<br>Centrality: %{customdata[1]:.3f}<extra></extra>",
+        hovertemplate=(
+            "<b>%{text}</b><br>Weighted degree: %{customdata[0]:.0f}"
+            "<br>Centrality: %{customdata[1]:.3f}"
+            "<br>Attributed fatalities: %{customdata[2]:.0f}"
+            "<br>Events observed: %{customdata[3]:.0f}<extra></extra>"
+        ),
     )
 
     network_fig = go.Figure(data=edge_traces + [node_trace])
@@ -1153,6 +1577,8 @@ def render_network_tab(filtered: pd.DataFrame):
                 "actor": list(subgraph.nodes()),
                 "weighted_degree": [weighted_degree.get(node, 0) for node in subgraph.nodes()],
                 "centrality": [centrality.get(node, 0) for node in subgraph.nodes()],
+                "attributed_fatalities": [subgraph.nodes[node].get("fatalities", 0) for node in subgraph.nodes()],
+                "events_observed": [subgraph.nodes[node].get("events", 0) for node in subgraph.nodes()],
             }
         )
         .sort_values("centrality", ascending=False)
@@ -1206,11 +1632,13 @@ def main():
     data = load_data()
     semantic_vectorizer, semantic_matrix, semantic_index = build_semantic_index(data[NOTES_COL])
     context_vectorizer, context_matrix, context_index, _ = build_context_matrix(data[NOTES_COL])
+    note_embeddings, note_index_lookup = build_note_embeddings(data[NOTES_COL])
 
     filter_state = render_sidebar(data)
     filtered = apply_filters(data, filter_state)
 
     st.success(f"Filtered dataset contains {len(filtered):,} events")
+    render_filter_summary(filtered, filter_state)
 
     if filtered.empty:
         st.warning("No events match the selected filters. Adjust the parameters in the sidebar to continue.")
@@ -1243,7 +1671,14 @@ def main():
             context_index,
         )
     with cluster_tab:
-        render_clustering_tab(filtered, context_matrix, context_index, context_vectorizer)
+        render_clustering_tab(
+            filtered,
+            context_matrix,
+            context_index,
+            context_vectorizer,
+            note_embeddings,
+            note_index_lookup,
+        )
     with network_tab:
         render_network_tab(filtered)
     with data_tab:
