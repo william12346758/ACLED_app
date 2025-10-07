@@ -1293,13 +1293,32 @@ def render_network_tab(filtered: pd.DataFrame):
     pos = nx.kamada_kawai_layout(subgraph, weight="weight")
 
     edge_traces: list[go.Scatter] = []
-    for src, dst, attrs in subgraph.edges(data=True):
+    edges_with_data = list(subgraph.edges(data=True))
+    if edges_with_data:
+        edge_weights = np.array(
+            [float(attrs.get("weight", 1.0)) for *_ignored, attrs in edges_with_data],
+            dtype=float,
+        )
+        if edge_weights.size and np.isfinite(edge_weights).all():
+            max_weight = edge_weights.max() if edge_weights.size else 0.0
+            if max_weight <= 0:
+                scaled_widths = np.full_like(edge_weights, 2.0)
+            else:
+                min_width, max_width = 1.2, 5.0
+                scaled = np.sqrt(edge_weights / max_weight)
+                scaled_widths = min_width + (max_width - min_width) * scaled
+        else:
+            scaled_widths = np.full(len(edges_with_data), 2.0)
+    else:
+        scaled_widths = []
+
+    for (src, dst, attrs), width in zip(edges_with_data, scaled_widths):
         weight = attrs.get("weight", 1)
         edge_trace = go.Scatter(
             x=[pos[src][0], pos[dst][0]],
             y=[pos[src][1], pos[dst][1]],
             mode="lines",
-            line=dict(width=0.8 + weight * 0.15, color="#bcd2e8"),
+            line=dict(width=float(width), color="#bcd2e8"),
             hoverinfo="text",
             text=f"{src} ↔ {dst}<br>Events: {weight}",
         )
