@@ -1,0 +1,106 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{geometry}
+\usepackage{hyperref}
+\geometry{margin=1in}
+
+\title{Methodology of the ACLED Conflict Analytics Application}
+\author{ACLED App Maintainers}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\bigskip
+
+\section{Data Ingestion and Pre-processing}
+Let $\mathcal{D}_0$ denote the raw event table delivered by ACLED. Each record is a tuple
+\[ d = (\texttt{event\_id\_cnty}, \texttt{event\_date}, \texttt{event\_type}, \texttt{sub\_event\_type}, \texttt{actor1}, \texttt{assoc\_actor\_1}, \texttt{inter1}, \texttt{country}, \texttt{admin1}, \texttt{latitude}, \texttt{longitude}, \texttt{notes}, \texttt{fatalities}) . \]
+
+The loader enforces the presence of the required subset $\mathcal{C} = \{\texttt{event\_date}, \texttt{latitude}, \texttt{longitude}, \texttt{notes}\}$. Missing columns trigger a failure. Parsing applies the deterministic map $f:\mathcal{D}_0 \to \mathcal{D}$ that:
+\begin{itemize}
+  \item casts $\texttt{event\_date}$ to a timestamp, $\texttt{fatalities}$ to $\mathbb{R}_{\ge 0}$, and coordinates to $\mathbb{R}$, coercing non-numeric values to $\mathrm{NaN}$;
+  \item removes rows with undefined temporal or spatial coordinates, so $\mathcal{D} = \{d \in \mathcal{D}_0 : \texttt{event\_date}, \texttt{latitude}, \texttt{longitude} \neq \mathrm{NaN}\}$;
+  \item augments each record with deterministic projections $\texttt{year} = \mathrm{year}(\texttt{event\_date})$, $\texttt{month} = \mathrm{YYYY{-}MM}$, $\texttt{week} = \mathrm{YYYY{-}WW}$;
+  \item imputes missing categorical fields with neutral tokens (e.g., ``Unknown actor'').
+\end{itemize}
+
+Caching stores $\mathcal{D}$ as a pickle when the source timestamps $t_{\text{source}}$ satisfy $t_{\text{cache}} \ge \max t_{\text{source}}$, ensuring read consistency.
+
+\section{Interactive Filtering Framework}
+The sidebar controls define a selection predicate $\phi: \mathcal{D} \to \{0,1\}$ that factorises as
+\[ \phi(d) = \phi_{\text{time}}(d) \cdot \phi_{\text{geo}}(d) \cdot \phi_{\text{type}}(d) \cdot \phi_{\text{text}}(d) \cdot \phi_{\text{coord}}(d), \]
+where each component is an indicator function:
+\begin{align*}
+  \phi_{\text{time}}(d) &= \mathbf{1}\{\tau_{\min} \le \texttt{event\_date}(d) \le \tau_{\max}\},\\
+  \phi_{\text{geo}}(d) &= \mathbf{1}\{\texttt{country}(d) \in C\} \cdot \mathbf{1}\{\texttt{admin1}(d) \in A\},\\
+  \phi_{\text{type}}(d) &= \mathbf{1}\{\texttt{event\_type}(d) \in T\},\\
+  \phi_{\text{coord}}(d) &= \mathbf{1}\{\ell_{\min} \le \texttt{latitude}(d) \le \ell_{\max}\} \cdot \mathbf{1}\{\lambda_{\min} \le \texttt{longitude}(d) \le \lambda_{\max}\},\\
+  \phi_{\text{text}}(d) &= \begin{cases}
+    \mathbf{1}\{\exists j : k_j \subseteq \texttt{field}_j(d)\} & \text{(match any)},\\
+    \prod_j \mathbf{1}\{k_j \subseteq \texttt{field}_j(d)\} & \text{(match all)},
+  \end{cases}
+\end{align*}
+with $\texttt{field}_j \in \{\texttt{notes}, \texttt{actor1}, \texttt{assoc\_actor\_1}, \texttt{admin1}, \texttt{location}\}$ and substrings evaluated case-insensitively. The working dataset is $\mathcal{D}_\phi = \{d \in \mathcal{D} : \phi(d) = 1\}$.
+
+\section{Semantic Search and Contextual Embeddings}
+\subsection{TF--IDF representation}
+Let $\mathcal{N}$ be the corpus of notes, indexed by $i$. The vectoriser constructs the vocabulary $V$ of unigrams and bigrams subject to document frequency thresholds. For token $t \in V$ and document $i$, the term frequency is $\mathrm{tf}_{i,t}$, and document frequency is $\mathrm{df}_t$. The TF--IDF weight follows the scikit-learn convention
+\[ w_{i,t} = \frac{\mathrm{tf}_{i,t}}{\lVert \mathrm{tf}_{i,\cdot} \rVert_2} \cdot \log\left(1 + \frac{1 + |\mathcal{N}|}{1 + \mathrm{df}_t}\right), \]
+producing the sparse matrix $X \in \mathbb{R}^{|\mathcal{N}| \times |V|}$. The semantic index stores $X$ together with a mapping from dataframe indices to matrix rows.
+
+\subsection{Cosine retrieval}
+Given a user query $q$, the same pipeline yields $v_q \in \mathbb{R}^{|V|}$. Cosine similarity orders candidate documents:
+\[ s_i = \cos(\theta_i) = \frac{X_i v_q}{\lVert X_i \rVert_2 \lVert v_q \rVert_2}. \]
+The application returns the top-$k$ rows with $s_i \ge 0.12$ after lexical validation.
+
+\subsection{Lexical validation}
+Let $Q$ be the set of content-bearing tokens extracted from the query and expanded through morphological heuristics. A candidate note $n$ is retained when either a two-token phrase from $q$ appears verbatim in $n$ or when $\sum_{q \in Q} \mathbf{1}\{q \subseteq n\} \ge \max(1, |Q| - 1)$. This conservative rule suppresses semantically similar yet off-topic matches.
+
+\subsection{Contextual dimensionality reduction}
+For clustering support, the compact vectoriser uses a lower-dimensional TF--IDF matrix $X^{(c)}$. Given a subset of rows, the app fits a truncated singular value decomposition (SVD)
+\[ X^{(c)} \approx U_k \Sigma_k V_k^\top, \]
+where $k \le 12$ balances fidelity and runtime. The reduced embedding $Z = U_k \Sigma_k$ aligns with the dataframe order by zero-filling rows lacking textual context.
+
+\section{Clustering Pipeline}
+Users choose feature columns $\mathcal{F}$ for clustering. The pipeline partitions $\mathcal{F}$ into numeric and categorical subsets.
+\begin{itemize}
+  \item Numeric features $x \in \mathbb{R}^p$ undergo column-wise imputation via medians $m_j$ and standardisation $x'_j = (x_j - m_j) / s_j$, where $s_j$ is the sample standard deviation.
+  \item Categorical features are one-hot encoded into binary vectors $y \in \{0,1\}^q$ with unknown levels mapped to an ``Unknown'' token.
+  \item Optional contextual embeddings $Z \in \mathbb{R}^{n \times k}$ from the SVD step are concatenated.
+\end{itemize}
+The resulting design matrix $M \in \mathbb{R}^{n \times (p + q + k)}$ is clustered with K-Means, solving
+\[ \min_{\{c_i\}_{i=1}^n, \{\mu_j\}_{j=1}^K} \sum_{i=1}^n \left\lVert M_i - \mu_{c_i} \right\rVert_2^2, \]
+via Lloyd's algorithm with $n_{\text{init}} = \texttt{auto}$ (or $10$ for legacy scikit-learn). The model assigns label $c_i \in \{1,\dots,K\}$ to event $i$.
+
+Cluster quality is estimated with the silhouette coefficient
+\[ \mathrm{sil}(i) = \frac{b(i) - a(i)}{\max\{a(i), b(i)\}}, \]
+where $a(i)$ is the mean intra-cluster distance for observation $i$ and $b(i)$ the minimum mean distance to other clusters. The overall silhouette is the arithmetic mean of $\mathrm{sil}(i)$ for $i=1,\dots,n$ when $K>1$.
+
+Cluster summaries rely on TF--IDF term strengths. For cluster $g$, the aggregated TF--IDF vector $t_g = \sum_{i \in g} X^{(c)}_i$ is filtered to conflict-specific terms through heuristic predicate $\psi$ (e.g., removing months and numeric strings). The top entries of $\psi(t_g)$ yield the dominant theme descriptors.
+
+\section{Network Construction and Visual Encoding}
+The actor tab constructs a bipartite graph $G = (V, E)$ with partition $V = V_A \cup V_C$ representing concrete actors and ACLED actor categories. For every filtered event $d$ the pipeline adds an undirected edge $\{a, c\}$ where $a = \texttt{actor1}(d)$ and $c = \texttt{inter1}(d)$. Edge weights accumulate event counts:
+\[ w(a,c) = |\{ d \in \mathcal{D}_\phi : \texttt{actor1}(d) = a, \texttt{inter1}(d) = c \}|. \]
+Node attributes store fatality totals $F(v) = \sum_{d \mapsto v} \texttt{fatalities}(d)$ and event counts.
+
+Visualization uses the Kamada--Kawai spring layout seeded by $w(a,c)$. Edge stroke widths are square-root normalised to stabilise visual ratios:
+\[ \mathrm{width}(a,c) = w_{\min} + (w_{\max} - w_{\min}) \sqrt{\frac{w(a,c)}{\max_{e \in E} w(e)}} . \]
+Node radii follow the same transformation on weighted degrees. Colour intensity encodes $F(v)$ with a continuous scale; hover tooltips surface the narrative generated by the templated summary string.
+
+\section{Visualization and Aggregation Layers}
+The overview tab computes aggregate metrics from $\mathcal{D}_\phi$ such as total fatalities $\sum_{d \in \mathcal{D}_\phi} \texttt{fatalities}(d)$, unique actor counts, and time-series counts grouped by month or week. Plotly Express is used for bar, line, and choropleth charts with palettes chosen to minimise perceptual ambiguity.
+
+Geo-spatial plots rely on latitude and longitude for scatter mapbox layers. Fatality scaling uses piecewise-linear mappings with clipping to stabilise symbol sizes across heavy-tailed distributions.
+
+\section{Caching and Determinism}
+Two levels of caching guarantee reproducibility while maintaining interactivity:
+\begin{enumerate}
+  \item A filesystem cache stores $\mathcal{D}$ when source files remain unchanged.
+  \item Streamlit's `st.cache_resource` wraps the TF--IDF and SVD constructions, making the numerical artefacts deterministic as long as the underlying data remain fixed. Randomised algorithms (K-Means, SVD) receive explicit seeds (42) to ensure repeatable clustering and embeddings.
+\end{enumerate}
+
+\section{Extensibility Considerations}
+The modular design exposes pure functions for data loading, filtering, semantic search, clustering, and network construction. Each function accepts explicit pandas objects or NumPy arrays, simplifying downstream testing. Additional analytics can compose these building blocks while preserving the mathematical invariants documented above.
+
+\end{document}
